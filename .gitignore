@@ -45,3 +45,4 @@ vcpkg_installed/
 
 # Local documentation (not tracked in git)
 CLAUDE.md
+claude.md
