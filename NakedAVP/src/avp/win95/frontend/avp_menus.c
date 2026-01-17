@@ -227,6 +227,26 @@ static BOOL LaunchingMplayer=FALSE;
 static int MultiplayerConfigurationIndex; //just used for the configuration deletion stuff
 static const char* MultiplayerConfigurationName=0; //ditto
 
+/* Accessibility: Announce help string for current menu element */
+static void Accessibility_AnnounceHelpString(void)
+{
+    AVPMENU_ELEMENT *elementPtr = &AvPMenus.MenuElements[AvPMenus.CurrentlySelectedElement];
+
+    /* Only announce help strings if they exist and we're not in-game menu */
+    if (elementPtr->HelpString != TEXTSTRING_BLANK && AvPMenus.MenusState != MENUSSTATE_INGAMEMENUS)
+    {
+        const char *helpText = GetTextString(elementPtr->HelpString);
+        if (helpText && helpText[0])
+        {
+            /* Queue the help string so it plays after the main announcement */
+            TTS_SpeakQueued(helpText);
+        }
+    }
+
+    /* Set cooldown to prevent render hooks from re-announcing */
+    Menu_SetAnnouncementCooldown();
+}
+
 /* Accessibility: Announce current menu selection */
 static void Accessibility_AnnounceMenuSelection(void)
 {
@@ -236,6 +256,7 @@ static void Accessibility_AnnounceMenuSelection(void)
     static char announceBuffer[512];
     const char *label = NULL;
     const char *value = NULL;
+    int announcedSomething = 0;
 
     /* Special handling for user profile selection menu */
     if (AvPMenus.CurrentMenu == AVPMENU_USERPROFILESELECT)
@@ -251,7 +272,9 @@ static void Accessibility_AnnounceMenuSelection(void)
         if (profilePtr && profilePtr->Name[0])
         {
             TTS_Speak(profilePtr->Name);
+            announcedSomething = 1;
         }
+        if (announcedSomething) Accessibility_AnnounceHelpString();
         return;
     }
 
@@ -266,7 +289,9 @@ static void Accessibility_AnnounceMenuSelection(void)
         if (episodeName && episodeName[0])
         {
             TTS_Speak(episodeName);
+            announcedSomething = 1;
         }
+        if (announcedSomething) Accessibility_AnnounceHelpString();
         return;
     }
 
@@ -291,6 +316,7 @@ static void Accessibility_AnnounceMenuSelection(void)
             {
                 TTS_Speak(value);
             }
+            Accessibility_AnnounceHelpString();
             return;
         }
 
@@ -312,6 +338,7 @@ static void Accessibility_AnnounceMenuSelection(void)
             {
                 TTS_Speak(value);
             }
+            Accessibility_AnnounceHelpString();
             return;
         }
 
@@ -324,6 +351,7 @@ static void Accessibility_AnnounceMenuSelection(void)
             int percentage = (maxVal > 0) ? (currentVal * 100 / maxVal) : 0;
             snprintf(announceBuffer, sizeof(announceBuffer), "%s: %d percent", label ? label : "Slider", percentage);
             TTS_Speak(announceBuffer);
+            Accessibility_AnnounceHelpString();
             return;
         }
 
@@ -334,6 +362,7 @@ static void Accessibility_AnnounceMenuSelection(void)
             int toggleVal = *(elementPtr->c.ToggleValuePtr);
             snprintf(announceBuffer, sizeof(announceBuffer), "%s: %s", label ? label : "Option", toggleVal ? "On" : "Off");
             TTS_Speak(announceBuffer);
+            Accessibility_AnnounceHelpString();
             return;
         }
 
@@ -353,6 +382,7 @@ static void Accessibility_AnnounceMenuSelection(void)
                 snprintf(announceBuffer, sizeof(announceBuffer), "%s: %d", label ? label : "Value", numVal);
             }
             TTS_Speak(announceBuffer);
+            Accessibility_AnnounceHelpString();
             return;
         }
 
@@ -361,6 +391,7 @@ static void Accessibility_AnnounceMenuSelection(void)
             /* Video mode - announce label */
             label = GetTextString(elementPtr->a.TextDescription);
             TTS_Speak(label ? label : "Video Mode");
+            Accessibility_AnnounceHelpString();
             return;
         }
 
@@ -384,6 +415,7 @@ static void Accessibility_AnnounceMenuSelection(void)
             {
                 TTS_Speak(label);
             }
+            Accessibility_AnnounceHelpString();
             return;
         }
 
@@ -395,6 +427,7 @@ static void Accessibility_AnnounceMenuSelection(void)
             const char* slotType = (elementPtr->ElementID == AVPMENU_ELEMENT_LOADGAME) ? "Load" : "Save";
             snprintf(announceBuffer, sizeof(announceBuffer), "%s Slot %d", slotType, slotNum);
             TTS_Speak(announceBuffer);
+            Accessibility_AnnounceHelpString();
             return;
         }
 
@@ -407,6 +440,7 @@ static void Accessibility_AnnounceMenuSelection(void)
                 snprintf(announceBuffer, sizeof(announceBuffer), "Difficulty: %s", label);
                 TTS_Speak(announceBuffer);
             }
+            Accessibility_AnnounceHelpString();
             return;
         }
 
@@ -419,6 +453,7 @@ static void Accessibility_AnnounceMenuSelection(void)
             {
                 TTS_Speak(label);
             }
+            Accessibility_AnnounceHelpString();
             return;
         }
 
@@ -427,6 +462,7 @@ static void Accessibility_AnnounceMenuSelection(void)
             /* Quit game option */
             label = GetTextString(elementPtr->a.TextDescription);
             TTS_Speak(label ? label : "Exit Game");
+            Accessibility_AnnounceHelpString();
             return;
         }
 
@@ -435,6 +471,7 @@ static void Accessibility_AnnounceMenuSelection(void)
             /* Resume game option */
             label = GetTextString(elementPtr->a.TextDescription);
             TTS_Speak(label ? label : "Resume Game");
+            Accessibility_AnnounceHelpString();
             return;
         }
 
@@ -443,6 +480,7 @@ static void Accessibility_AnnounceMenuSelection(void)
             /* Restart game option */
             label = GetTextString(elementPtr->a.TextDescription);
             TTS_Speak(label ? label : "Restart Mission");
+            Accessibility_AnnounceHelpString();
             return;
         }
 
@@ -454,6 +492,7 @@ static void Accessibility_AnnounceMenuSelection(void)
             {
                 TTS_Speak(label);
             }
+            Accessibility_AnnounceHelpString();
             return;
         }
     }
@@ -1421,6 +1460,7 @@ static void SetupNewMenu(enum AVPMENU_ID menuID)
 		}
 		/* Then announce the currently selected item */
 		Accessibility_AnnounceMenuSelection();
+		Menu_SetAnnouncementCooldown();  /* Prevent render hooks from double-announcing */
 	}
 }
 
@@ -2265,6 +2305,15 @@ static void ActUponUsersInput(void)
 			elementPtr->c.TextPtr[AvPMenus.PositionInTextField] = 0;
 			AvPMenus.UserEnteringText = 0;
 
+			/* Accessibility: Announce the completed text entry */
+			if (AvPMenus.PositionInTextField > 0) {
+				char buf[128];
+				sprintf(buf, "Entered: %s", elementPtr->c.TextPtr);
+				TTS_Speak(buf);
+			} else {
+				TTS_Speak("Text cleared");
+			}
+
 			// KJL 10:09:35 09/02/00 - when the user has entered their name,
 			// move down to the next option. If the user enters a null
 			// string, replace it with a placeholder name		
@@ -2285,6 +2334,11 @@ static void ActUponUsersInput(void)
 		{
 			if (AvPMenus.PositionInTextField>0)
 			{
+				/* Accessibility: Announce deleted character */
+				char deletedChar = elementPtr->c.TextPtr[AvPMenus.PositionInTextField-1];
+				char charBuf[2] = {deletedChar, '\0'};
+				TTS_Speak(charBuf);
+
 				elementPtr->c.TextPtr[--AvPMenus.PositionInTextField] = 0;
 			}
 		}
@@ -2339,6 +2393,12 @@ static void ActUponUsersInput(void)
 
 						elementPtr->c.TextPtr[AvPMenus.PositionInTextField++] = c;
 						elementPtr->c.TextPtr[AvPMenus.PositionInTextField] = 0;
+
+						/* Accessibility: Announce typed character */
+						{
+							char charBuf[2] = {c, '\0'};
+							TTS_Speak(charBuf);
+						}
 					}
 				}
 
@@ -2353,10 +2413,24 @@ static void ActUponUsersInput(void)
 		if (DebouncedKeyboardInput[KEY_ESCAPE] || DebouncedKeyboardInput[KEY_CR])
 		{
 			AvPMenus.UserEnteringNumber = 0;
+
+			/* Accessibility: Announce the entered number */
+			{
+				char buf[64];
+				sprintf(buf, "Value: %d", *elementPtr->c.NumberPtr);
+				TTS_Speak(buf);
+			}
 		}
 		else if (DebouncedKeyboardInput[KEY_BACKSPACE] || DebouncedKeyboardInput[KEY_LEFT])
 		{
 			(*elementPtr->c.NumberPtr)/=10;
+
+			/* Accessibility: Announce current value after backspace */
+			{
+				char buf[64];
+				sprintf(buf, "%d", *elementPtr->c.NumberPtr);
+				TTS_Speak(buf);
+			}
 		}
 		else
 		{
@@ -2375,6 +2449,12 @@ static void ActUponUsersInput(void)
 						if((*elementPtr->c.NumberPtr)>elementPtr->b.MaxValue)
 						{
 							(*elementPtr->c.NumberPtr)=elementPtr->b.MaxValue;
+						}
+
+						/* Accessibility: Announce the typed digit */
+						{
+							char charBuf[2] = {c, '\0'};
+							TTS_Speak(charBuf);
 						}
 					}
 				}
@@ -2509,6 +2589,7 @@ static void ActUponUsersInput(void)
 					{
 						InteractWithMenuElement(AVPMENU_ELEMENT_INTERACTION_DECREASE);
 						Accessibility_AnnounceMenuSelection();
+						Menu_SetAnnouncementCooldown();
 						break;
 					}
 					case AVPMENU_MARINEKEYCONFIG:
@@ -2520,6 +2601,7 @@ static void ActUponUsersInput(void)
 							AvPMenus.CurrentlySelectedElement--;
 							Sound_Play(SID_MENUS_CHANGE_ITEM,"r");
 							Accessibility_AnnounceMenuSelection();
+							Menu_SetAnnouncementCooldown();
 						}
 						break;
 					}
@@ -2532,6 +2614,7 @@ static void ActUponUsersInput(void)
 						}
 						Sound_Play(SID_MENUS_CHANGE_ITEM,"r");
 						Accessibility_AnnounceMenuSelection();
+						Menu_SetAnnouncementCooldown();
 						break;
 					}
 				}
@@ -2556,6 +2639,7 @@ static void ActUponUsersInput(void)
 					{
 						InteractWithMenuElement(AVPMENU_ELEMENT_INTERACTION_INCREASE);
 						Accessibility_AnnounceMenuSelection();
+						Menu_SetAnnouncementCooldown();
 						break;
 					}
 					case AVPMENU_MARINEKEYCONFIG:
@@ -2567,6 +2651,7 @@ static void ActUponUsersInput(void)
 							AvPMenus.CurrentlySelectedElement++;
 							Sound_Play(SID_MENUS_CHANGE_ITEM,"r");
 							Accessibility_AnnounceMenuSelection();
+							Menu_SetAnnouncementCooldown();
 						}
 						break;
 					}
@@ -2579,6 +2664,7 @@ static void ActUponUsersInput(void)
 						}
 						Sound_Play(SID_MENUS_CHANGE_ITEM,"r");
 						Accessibility_AnnounceMenuSelection();
+						Menu_SetAnnouncementCooldown();
 						break;
 					}
 				}
@@ -2596,6 +2682,7 @@ static void ActUponUsersInput(void)
 			{
 				InteractWithMenuElement(AVPMENU_ELEMENT_INTERACTION_DECREASE);
 				Accessibility_AnnounceMenuSelection();  /* Announce value change */
+				Menu_SetAnnouncementCooldown();
 				InputIsDebounced = 0;
 			}
 			else
@@ -2609,6 +2696,7 @@ static void ActUponUsersInput(void)
 			{
 				InteractWithMenuElement(AVPMENU_ELEMENT_INTERACTION_INCREASE);
 				Accessibility_AnnounceMenuSelection();  /* Announce value change */
+				Menu_SetAnnouncementCooldown();
 				InputIsDebounced = 0;
 			}
 			else

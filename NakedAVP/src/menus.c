@@ -400,10 +400,8 @@ int RenderMenuText(char *textPtr, int sx, int sy, int alpha, enum AVPMENUFORMAT_
 {
 	int width;
 
-	/* Accessibility: Announce selected menu text (high alpha = selected) */
-	if (textPtr && alpha > BRIGHTNESS_OF_DARKENED_ELEMENT) {
-		Menu_OnTextDisplayed(textPtr, 1);
-	}
+	/* Accessibility: Menu announcements are handled by Accessibility_AnnounceMenuSelection
+	 * in avp_menus.c when user navigates. No render hook needed. */
 
 	width = LengthOfMenuText(textPtr);
 
@@ -509,9 +507,9 @@ int RenderMenuText(char *textPtr, int sx, int sy, int alpha, enum AVPMENUFORMAT_
 }
 
 int RenderMenuText_Clipped(char *textPtr, int sx, int sy, int alpha, enum AVPMENUFORMAT_ID format, int topY, int bottomY)
-{	
+{
 	int width = LengthOfMenuText(textPtr);
-	
+
 	switch(format) {
 		default:
 			GLOBALASSERT("UNKNOWN TEXT FORMAT"==0);
@@ -525,9 +523,11 @@ int RenderMenuText_Clipped(char *textPtr, int sx, int sy, int alpha, enum AVPMEN
 			sx -= width / 2;
 			break;
 	}
-	
+
 	LOCALASSERT(x>0);
-	
+
+	/* Accessibility: Menu announcements are handled by Accessibility_AnnounceMenuSelection */
+
 	if (alpha > BRIGHTNESS_OF_DARKENED_ELEMENT) {
 		int size = width - 18;
 		if (size<18) size = 18;
@@ -872,7 +872,9 @@ int RenderSmallMenuText(char *textPtr, int x, int y, int alpha, enum AVPMENUFORM
 {
 	int length;
 	char *ptr;
-	
+
+	/* Accessibility: Menu announcements are handled by Accessibility_AnnounceMenuSelection */
+
 	switch(format) {
 		default:
 			GLOBALASSERT("UNKNOWN TEXT FORMAT"==0);
@@ -882,27 +884,27 @@ int RenderSmallMenuText(char *textPtr, int x, int y, int alpha, enum AVPMENUFORM
 		case AVPMENUFORMAT_RIGHTJUSTIFIED:
 			length = 0;
 			ptr = textPtr;
-			
+
 			while (*ptr) {
 				length+=AAFontWidths[(unsigned char) *ptr++];
 			}
-			
+
 			x -= length;
 			break;
 		case AVPMENUFORMAT_CENTREJUSTIFIED:
 			length = 0;
 			ptr = textPtr;
-			
+
 			while (*ptr) {
 				length+=AAFontWidths[(unsigned char) *ptr++];
 			}
-			
+
 			x -= length / 2;
 			break;
 	}
-	
+
 	LOCALASSERT(x>0);
-	
+
 	return RenderSmallFontString(textPtr,x,y,alpha,ONE_FIXED,ONE_FIXED,ONE_FIXED);
 }
 
@@ -910,7 +912,9 @@ int RenderSmallMenuText_Coloured(char *textPtr, int x, int y, int alpha, enum AV
 {
 	int length;
 	char *ptr;
-	
+
+	/* Accessibility: Menu announcements are handled by Accessibility_AnnounceMenuSelection */
+
 	switch(format) {
 		default:
 			GLOBALASSERT("UNKNOWN TEXT FORMAT"==0);
@@ -920,28 +924,28 @@ int RenderSmallMenuText_Coloured(char *textPtr, int x, int y, int alpha, enum AV
 		case AVPMENUFORMAT_RIGHTJUSTIFIED:
 			length = 0;
 			ptr = textPtr;
-	
+
 			while (*ptr) {
 				length+=AAFontWidths[(unsigned char) *ptr++];
 			}
-			
+
 			x -= length;
 			break;
 		case AVPMENUFORMAT_CENTREJUSTIFIED:
 			length = 0;
 			ptr = textPtr;
-			
+
 			while (*ptr) {
 				length+=AAFontWidths[(unsigned char) *ptr++];
 			}
-			
+
 			x -= length / 2;
 			break;
 	}
-	
+
 	LOCALASSERT(x>0);
-	
-	return RenderSmallFontString(textPtr,x,y,alpha,red,green,blue);			
+
+	return RenderSmallFontString(textPtr,x,y,alpha,red,green,blue);
 }
 
 static void CalculateWidthsOfAAFont()

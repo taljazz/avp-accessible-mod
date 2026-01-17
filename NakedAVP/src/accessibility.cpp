@@ -1,9 +1,9 @@
 /*
  * AVP Accessibility Module - Implementation
  *
- * Uses Windows SAPI (Speech API) for text-to-speech.
+ * Uses Tolk library for screen reader support (NVDA, JAWS, etc.)
  * Uses OpenAL for directional audio radar tones.
- * SAPI is the underlying API that System.Speech wraps.
+ * Tolk provides a unified interface to screen readers with SAPI fallback.
  */
 
 #include <stdio.h>
@@ -15,10 +15,7 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <sapi.h>
-#include <sphelper.h>
-#pragma comment(lib, "sapi.lib")
-#pragma comment(lib, "ole32.lib")
+#include "Tolk.h"
 #endif
 
 /* OpenAL for directional tones */
@@ -50,6 +47,10 @@ extern DISPLAYBLOCK *OnScreenBlockList[];
 extern TEMPLATE_WEAPON_DATA TemplateWeapon[];
 extern TEMPLATE_AMMO_DATA TemplateAmmo[];
 
+/* Vision mode for predator equipment tracking */
+extern enum VISION_MODE_ID CurrentVisionMode;
+/* Note: PLAYERCLOAK_MAXENERGY is defined in bh_types.h */
+
 /* Line of sight check */
 int IsThisObjectVisibleFromThisPosition_WithIgnore(DISPLAYBLOCK *ignoredObjectPtr,
     DISPLAYBLOCK *objectPtr, VECTORCH *positionPtr, int maxRange);
@@ -79,6 +80,84 @@ ACCESSIBILITY_CONFIG AccessibilitySettings = {
 static int g_AccessibilityInitialized = 0;
 static int g_DebugMode = 0;
 
+/* ============================================
+ * Logging System
+ * ============================================ */
+
+typedef enum {
+    LOG_DEBUG = 0,
+    LOG_INFO = 1,
+    LOG_WARNING = 2,
+    LOG_ERROR = 3
+} LOG_LEVEL;
+
+static FILE* g_LogFile = NULL;
+static int g_LoggingEnabled = 1;
+static LOG_LEVEL g_LogLevel = LOG_DEBUG;  /* Default to DEBUG for troubleshooting */
+
+static const char* LogLevelNames[] = { "DEBUG", "INFO", "WARNING", "ERROR" };
+
+/* Initialize logging system */
+static void Log_Init(void)
+{
+    if (g_LogFile != NULL) return;  /* Already initialized */
+
+    char logPath[MAX_PATH];
+    GetCurrentDirectoryA(MAX_PATH, logPath);
+    strcat(logPath, "\\accessibility_log.txt");
+
+    g_LogFile = fopen(logPath, "w");
+    if (g_LogFile) {
+        /* Write header */
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        fprintf(g_LogFile, "=== AVP Accessibility Log ===\n");
+        fprintf(g_LogFile, "Started: %04d-%02d-%02d %02d:%02d:%02d\n\n",
+                st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+        fflush(g_LogFile);
+    }
+}
+
+/* Shutdown logging system */
+static void Log_Shutdown(void)
+{
+    if (g_LogFile) {
+        fprintf(g_LogFile, "\n=== Log Closed ===\n");
+        fclose(g_LogFile);
+        g_LogFile = NULL;
+    }
+}
+
+/* Write a log entry */
+static void Log_Write(LOG_LEVEL level, const char* format, ...)
+{
+    if (!g_LoggingEnabled || !g_LogFile) return;
+    if (level < g_LogLevel) return;  /* Filter by log level */
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+
+    /* Timestamp and level */
+    fprintf(g_LogFile, "[%04d-%02d-%02d %02d:%02d:%02d.%03d] [%s] ",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+            LogLevelNames[level]);
+
+    /* Message */
+    va_list args;
+    va_start(args, format);
+    vfprintf(g_LogFile, format, args);
+    va_end(args);
+
+    fprintf(g_LogFile, "\n");
+    fflush(g_LogFile);
+}
+
+/* Convenience macros */
+#define LOG_DBG(fmt, ...) Log_Write(LOG_DEBUG, fmt, ##__VA_ARGS__)
+#define LOG_INF(fmt, ...) Log_Write(LOG_INFO, fmt, ##__VA_ARGS__)
+#define LOG_WRN(fmt, ...) Log_Write(LOG_WARNING, fmt, ##__VA_ARGS__)
+#define LOG_ERR(fmt, ...) Log_Write(LOG_ERROR, fmt, ##__VA_ARGS__)
+
 /* Player state tracking for change detection */
 static int g_LastHealth = -1;
 static int g_LastArmor = -1;
@@ -102,6 +181,13 @@ static int g_LastPitchZone = 0;  /* -1 = looking down, 0 = level, 1 = looking up
 static int g_PitchIndicatorEnabled = 1;
 static int g_LastPitchToneTime = 0;
 
+/* Arrow key rotation/look control */
+#define ARROW_ROTATION_SPEED 40      /* Rotation speed per frame (EulerY angular velocity) */
+#define ARROW_PITCH_SPEED 512        /* Pitch adjustment per frame (ViewPanX units) */
+#define PITCH_CENTER_THRESHOLD 64    /* Pitch considered "centered" if within this range */
+static int g_WasPitchOffCenter = 0;  /* Track if pitch was off-center for centering tone */
+static int g_LastCenteringToneTime = 0;  /* Debounce centering tone */
+
 /* Interaction detection state */
 static int g_LastInteractiveNearby = 0;  /* Was an interactive nearby last frame? */
 static char g_LastInteractiveType[64] = {0};  /* Type of last interactive */
@@ -114,6 +200,11 @@ static int g_LastSecondaryRounds = -1;
 
 /* On-screen message tracking */
 static char g_LastOnScreenMessage[256] = {0};  /* Prevent duplicate announcements */
+
+/* Predator equipment tracking */
+static int g_LastCloakOn = -1;           /* Cloak state (-1 = unknown) */
+static int g_LastVisionMode = -1;        /* Vision mode enum value */
+static int g_LastFieldChargePercent = -1; /* Energy percentage (0-100) */
 
 /* Obstruction announcement tracking */
 static char g_LastObstructionText[256] = {0};  /* Prevent repeating same obstruction */
@@ -236,9 +327,8 @@ static void Announcement_RecordTime(ANNOUNCE_PRIORITY priority)
 }
 
 #ifdef _WIN32
-/* SAPI COM interface */
-static ISpVoice* g_pVoice = NULL;
-static int g_COMInitialized = 0;
+/* Tolk screen reader library state */
+static int g_TolkInitialized = 0;
 #endif
 
 /* ============================================
@@ -356,14 +446,43 @@ static void RadarTone_Shutdown(void)
     g_RadarToneInitialized = 0;
 }
 
+/* Get pitch multiplier for enemy type - different enemies have distinct tones
+ * Aliens: Lower, menacing (0.75x)
+ * Predators: Mid-range, distinctive (1.2x)
+ * Marines: Higher, sharp (1.5x)
+ * Facehuggers: Very high, frantic (1.8x)
+ * Queen: Very low, ominous (0.6x)
+ */
+static float GetEnemyPitchMultiplier(AVP_BEHAVIOUR_TYPE bhvr)
+{
+    switch (bhvr) {
+        case I_BehaviourAlien:
+            return 0.75f;  /* Lower, menacing */
+        case I_BehaviourQueenAlien:
+            return 0.6f;   /* Very low, ominous */
+        case I_BehaviourFaceHugger:
+            return 1.8f;   /* High, frantic */
+        case I_BehaviourPredator:
+            return 1.2f;   /* Distinctive mid-high */
+        case I_BehaviourXenoborg:
+            return 0.9f;   /* Slightly lower, mechanical feel */
+        case I_BehaviourMarine:
+        case I_BehaviourSeal:
+            return 1.5f;   /* Higher, sharp */
+        default:
+            return 1.0f;   /* Default */
+    }
+}
+
 /* Play a directional radar tone for an entity
  * - Position determines stereo panning (left/right/front/back)
  * - Vertical offset determines pitch (above = higher, below = lower)
  * - Distance affects volume
+ * - Entity type affects base pitch (different enemies have distinct tones)
  */
 static void RadarTone_PlayDirectional(int targetX, int targetY, int targetZ,
                                        int playerX, int playerY, int playerZ,
-                                       int playerYaw)
+                                       int playerYaw, AVP_BEHAVIOUR_TYPE entityType)
 {
     if (!g_RadarToneInitialized) {
         if (!RadarTone_Init()) return;
@@ -402,9 +521,9 @@ static void RadarTone_PlayDirectional(int targetX, int targetY, int targetZ,
     /* Set source position in 3D space */
     alSource3f(g_RadarToneSource, AL_POSITION, posX, posY, posZ);
 
-    /* Calculate pitch based on vertical offset
-     * Above player = higher pitch, below = lower pitch
-     * Range: 0.7 (below) to 1.5 (above), 1.0 at same level
+    /* Calculate pitch based on:
+     * 1. Enemy type (different enemies have distinct base tones)
+     * 2. Vertical offset (above = higher pitch, below = lower)
      */
     float distance = sqrtf(dx*dx + dy*dy + dz*dz);
     float verticalRatio = 0.0f;
@@ -412,10 +531,15 @@ static void RadarTone_PlayDirectional(int targetX, int targetY, int targetZ,
         verticalRatio = dy / distance;  /* -1 to 1 range */
     }
 
-    /* Map vertical ratio to pitch: -1 (below) -> 0.7, 0 (level) -> 1.0, 1 (above) -> 1.5 */
-    float pitch = 1.0f + (verticalRatio * 0.4f);
-    if (pitch < 0.6f) pitch = 0.6f;
-    if (pitch > 1.6f) pitch = 1.6f;
+    /* Get enemy-specific pitch multiplier */
+    float enemyPitch = GetEnemyPitchMultiplier(entityType);
+
+    /* Apply vertical variation: -1 (below) -> -0.3, 0 (level) -> 0, 1 (above) -> +0.3 */
+    float pitch = enemyPitch + (verticalRatio * 0.3f);
+
+    /* Clamp to reasonable range */
+    if (pitch < 0.4f) pitch = 0.4f;
+    if (pitch > 2.5f) pitch = 2.5f;
 
     alSourcef(g_RadarToneSource, AL_PITCH, pitch);
 
@@ -580,66 +704,85 @@ static void PitchTone_Play(int pitchAngle)
     alSourcePlay(g_PitchToneSource);
 }
 
+/* Play a short "centered" tone - higher pitch, quick sound to indicate level view */
+static void CenteringTone_Play(void)
+{
+    if (!g_PitchToneInitialized || !g_PitchToneSource) {
+        return;
+    }
+
+    /* Play at higher pitch (1.5x) to distinguish from regular pitch indicator */
+    alSourcef(g_PitchToneSource, AL_PITCH, 1.5f);
+    alSourcef(g_PitchToneSource, AL_GAIN, 0.4f);
+
+    /* Position at listener (center) */
+    alSource3f(g_PitchToneSource, AL_POSITION, 0.0f, 0.0f, 0.0f);
+
+    /* Play the tone */
+    alSourceRewind(g_PitchToneSource);
+    alSourcePlay(g_PitchToneSource);
+}
+
 /* ============================================
- * TTS Implementation (Windows SAPI)
+ * TTS Implementation (Tolk Screen Reader Library)
  * ============================================ */
 
 #ifdef _WIN32
 
-static int TTS_InitSAPI(void)
+static int TTS_InitTolk(void)
 {
-    HRESULT hr;
-
-    if (g_pVoice != NULL) {
+    if (g_TolkInitialized) {
         return 1; /* Already initialized */
     }
 
-    /* Initialize COM */
-    if (!g_COMInitialized) {
-        hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
-        if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
-            Accessibility_Log("Failed to initialize COM: 0x%08X\n", hr);
-            return 0;
-        }
-        g_COMInitialized = 1;
-    }
+    /* Enable SAPI as fallback when no screen reader is running */
+    Tolk_TrySAPI(true);
 
-    /* Create SAPI voice */
-    hr = CoCreateInstance(CLSID_SpVoice, NULL, CLSCTX_ALL,
-                          IID_ISpVoice, (void**)&g_pVoice);
-    if (FAILED(hr)) {
-        Accessibility_Log("Failed to create SAPI voice: 0x%08X\n", hr);
+    /* Initialize Tolk (also initializes COM) */
+    Tolk_Load();
+
+    if (!Tolk_IsLoaded()) {
+        Accessibility_Log("Failed to initialize Tolk\n");
         return 0;
     }
 
-    /* Set initial rate and volume */
-    g_pVoice->SetRate(AccessibilitySettings.tts_rate);
-    g_pVoice->SetVolume((USHORT)AccessibilitySettings.tts_volume);
+    g_TolkInitialized = 1;
 
-    Accessibility_Log("SAPI TTS initialized successfully\n");
+    /* Log which screen reader was detected */
+    const wchar_t* screenReader = Tolk_DetectScreenReader();
+    if (screenReader) {
+        /* Convert wide string to narrow for logging */
+        char screenReaderName[64];
+        WideCharToMultiByte(CP_UTF8, 0, screenReader, -1, screenReaderName, sizeof(screenReaderName), NULL, NULL);
+        Accessibility_Log("Tolk initialized with screen reader: %s\n", screenReaderName);
+        LOG_INF("Screen reader detected: %s", screenReaderName);
+    } else {
+        Accessibility_Log("Tolk initialized (no screen reader detected, using SAPI fallback)\n");
+        LOG_INF("No screen reader detected, using SAPI fallback");
+    }
+
+    /* Log Tolk capabilities */
+    LOG_INF("Tolk speech support: %s", Tolk_HasSpeech() ? "yes" : "no");
+    LOG_INF("Tolk braille support: %s", Tolk_HasBraille() ? "yes" : "no");
+
     return 1;
 }
 
-static void TTS_ShutdownSAPI(void)
+static void TTS_ShutdownTolk(void)
 {
-    if (g_pVoice != NULL) {
-        g_pVoice->Release();
-        g_pVoice = NULL;
-    }
-
-    if (g_COMInitialized) {
-        CoUninitialize();
-        g_COMInitialized = 0;
+    if (g_TolkInitialized) {
+        Tolk_Unload();
+        g_TolkInitialized = 0;
     }
 }
 
-static void TTS_SpeakInternal(const char* text, DWORD flags)
+static void TTS_SpeakInternal(const char* text, int interrupt)
 {
-    if (!g_pVoice || !text || !AccessibilitySettings.tts_enabled) {
+    if (!g_TolkInitialized || !text || !AccessibilitySettings.tts_enabled) {
         return;
     }
 
-    /* Convert to wide string for SAPI */
+    /* Convert to wide string for Tolk */
     int len = MultiByteToWideChar(CP_UTF8, 0, text, -1, NULL, 0);
     if (len <= 0) return;
 
@@ -648,8 +791,8 @@ static void TTS_SpeakInternal(const char* text, DWORD flags)
 
     MultiByteToWideChar(CP_UTF8, 0, text, -1, wtext, len);
 
-    /* Speak the text */
-    g_pVoice->Speak(wtext, flags, NULL);
+    /* Output through screen reader (speech + braille) */
+    Tolk_Output(wtext, interrupt ? true : false);
 
     free(wtext);
 
@@ -660,10 +803,10 @@ static void TTS_SpeakInternal(const char* text, DWORD flags)
 
 #else
 /* Non-Windows stub implementations */
-static int TTS_InitSAPI(void) { return 0; }
-static void TTS_ShutdownSAPI(void) {}
-static void TTS_SpeakInternal(const char* text, unsigned int flags) {
-    (void)text; (void)flags;
+static int TTS_InitTolk(void) { return 0; }
+static void TTS_ShutdownTolk(void) {}
+static void TTS_SpeakInternal(const char* text, int interrupt) {
+    (void)text; (void)interrupt;
 }
 #endif
 
@@ -676,14 +819,12 @@ extern "C" void TTS_Speak(const char* text)
     if (!AccessibilitySettings.enabled) return;
 
 #ifdef _WIN32
-    DWORD flags = SPF_ASYNC;
-    if (AccessibilitySettings.tts_interrupt) {
-        flags |= SPF_PURGEBEFORESPEAK;
-    }
-    TTS_SpeakInternal(text, flags);
+    /* Interrupt previous speech if configured */
+    int interrupt = AccessibilitySettings.tts_interrupt ? 1 : 0;
+    TTS_SpeakInternal(text, interrupt);
 #endif
 
-    Accessibility_Log("TTS: %s\n", text);
+    LOG_INF("TTS: %s", text);
 }
 
 extern "C" void TTS_SpeakQueued(const char* text)
@@ -691,7 +832,8 @@ extern "C" void TTS_SpeakQueued(const char* text)
     if (!AccessibilitySettings.enabled) return;
 
 #ifdef _WIN32
-    TTS_SpeakInternal(text, SPF_ASYNC);
+    /* Don't interrupt - queue after current speech */
+    TTS_SpeakInternal(text, 0);
 #endif
 }
 
@@ -700,15 +842,16 @@ extern "C" void TTS_SpeakPriority(const char* text)
     if (!AccessibilitySettings.enabled) return;
 
 #ifdef _WIN32
-    TTS_SpeakInternal(text, SPF_ASYNC | SPF_PURGEBEFORESPEAK);
+    /* Always interrupt previous speech */
+    TTS_SpeakInternal(text, 1);
 #endif
 }
 
 extern "C" void TTS_Stop(void)
 {
 #ifdef _WIN32
-    if (g_pVoice) {
-        g_pVoice->Speak(NULL, SPF_PURGEBEFORESPEAK, NULL);
+    if (g_TolkInitialized) {
+        Tolk_Silence();
     }
 #endif
 }
@@ -716,11 +859,8 @@ extern "C" void TTS_Stop(void)
 extern "C" int TTS_IsSpeaking(void)
 {
 #ifdef _WIN32
-    if (!g_pVoice) return 0;
-
-    SPVOICESTATUS status;
-    g_pVoice->GetStatus(&status, NULL);
-    return (status.dwRunningState == SPRS_IS_SPEAKING);
+    if (!g_TolkInitialized) return 0;
+    return Tolk_IsSpeaking() ? 1 : 0;
 #else
     return 0;
 #endif
@@ -728,29 +868,88 @@ extern "C" int TTS_IsSpeaking(void)
 
 extern "C" void TTS_SetRate(int rate)
 {
+    /* Rate adjustment not supported by Tolk - store setting for compatibility */
     if (rate < -10) rate = -10;
     if (rate > 10) rate = 10;
     AccessibilitySettings.tts_rate = rate;
-
-#ifdef _WIN32
-    if (g_pVoice) {
-        g_pVoice->SetRate(rate);
-    }
-#endif
+    /* Note: Tolk uses the screen reader's default speech settings */
 }
 
 extern "C" void TTS_SetVolume(int volume)
 {
+    /* Volume adjustment not supported by Tolk - store setting for compatibility */
     if (volume < 0) volume = 0;
     if (volume > 100) volume = 100;
     AccessibilitySettings.tts_volume = volume;
+    /* Note: Tolk uses the screen reader's default speech settings */
+}
+
+/* ============================================
+ * Configuration File Support
+ * ============================================ */
 
 #ifdef _WIN32
-    if (g_pVoice) {
-        g_pVoice->SetVolume((USHORT)volume);
+static void LoadConfigFile(void)
+{
+    char iniPath[MAX_PATH];
+    char buffer[64];
+
+    /* Try to find accessibility.ini in current directory */
+    GetCurrentDirectoryA(MAX_PATH, iniPath);
+    strcat(iniPath, "\\accessibility.ini");
+
+    /* Check if file exists */
+    DWORD attrs = GetFileAttributesA(iniPath);
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        Accessibility_Log("No accessibility.ini found, using defaults\n");
+        return;
     }
-#endif
+
+    Accessibility_Log("Loading config from %s\n", iniPath);
+
+    /* General settings */
+    AccessibilitySettings.enabled = GetPrivateProfileIntA("General", "Enabled", 1, iniPath);
+    AccessibilitySettings.tts_enabled = GetPrivateProfileIntA("General", "TTSEnabled", 1, iniPath);
+    AccessibilitySettings.audio_radar_enabled = GetPrivateProfileIntA("General", "RadarEnabled", 1, iniPath);
+    AccessibilitySettings.navigation_cues_enabled = GetPrivateProfileIntA("General", "NavigationCues", 1, iniPath);
+    AccessibilitySettings.state_announcements_enabled = GetPrivateProfileIntA("General", "StateAnnouncements", 1, iniPath);
+    AccessibilitySettings.menu_narration_enabled = GetPrivateProfileIntA("General", "MenuNarration", 1, iniPath);
+
+    /* TTS settings */
+    AccessibilitySettings.tts_rate = GetPrivateProfileIntA("TTS", "Rate", 0, iniPath);
+    if (AccessibilitySettings.tts_rate < -10) AccessibilitySettings.tts_rate = -10;
+    if (AccessibilitySettings.tts_rate > 10) AccessibilitySettings.tts_rate = 10;
+
+    AccessibilitySettings.tts_volume = GetPrivateProfileIntA("TTS", "Volume", 100, iniPath);
+    if (AccessibilitySettings.tts_volume < 0) AccessibilitySettings.tts_volume = 0;
+    if (AccessibilitySettings.tts_volume > 100) AccessibilitySettings.tts_volume = 100;
+
+    AccessibilitySettings.tts_interrupt = GetPrivateProfileIntA("TTS", "Interrupt", 1, iniPath);
+
+    /* Radar settings */
+    AccessibilitySettings.radar_update_interval_ms = GetPrivateProfileIntA("Radar", "UpdateInterval", 500, iniPath);
+    AccessibilitySettings.radar_max_enemies = GetPrivateProfileIntA("Radar", "MaxEnemies", 5, iniPath);
+    AccessibilitySettings.radar_range = GetPrivateProfileIntA("Radar", "Range", 50000, iniPath);
+
+    /* Warning thresholds */
+    AccessibilitySettings.health_warning_threshold = GetPrivateProfileIntA("Warnings", "HealthThreshold", 25, iniPath);
+    AccessibilitySettings.ammo_warning_threshold = GetPrivateProfileIntA("Warnings", "AmmoThreshold", 10, iniPath);
+
+    /* Logging settings */
+    g_LoggingEnabled = GetPrivateProfileIntA("Logging", "Enabled", 1, iniPath);
+
+    char levelStr[32];
+    GetPrivateProfileStringA("Logging", "Level", "DEBUG", levelStr, sizeof(levelStr), iniPath);
+    if (_stricmp(levelStr, "DEBUG") == 0) g_LogLevel = LOG_DEBUG;
+    else if (_stricmp(levelStr, "INFO") == 0) g_LogLevel = LOG_INFO;
+    else if (_stricmp(levelStr, "WARNING") == 0) g_LogLevel = LOG_WARNING;
+    else if (_stricmp(levelStr, "ERROR") == 0) g_LogLevel = LOG_ERROR;
+
+    LOG_INF("Config loaded successfully");
 }
+#else
+static void LoadConfigFile(void) { /* No-op on non-Windows */ }
+#endif
 
 /* ============================================
  * Initialization and Shutdown
@@ -762,10 +961,17 @@ extern "C" int Accessibility_Init(void)
         return 1;
     }
 
-    Accessibility_Log("Initializing accessibility system...\n");
+    /* Initialize logging first */
+    Log_Init();
+    LOG_INF("=== Accessibility System Starting ===");
 
-    /* Initialize TTS */
-    if (!TTS_InitSAPI()) {
+    /* Load configuration from INI file */
+    LoadConfigFile();
+
+    LOG_INF("Initializing accessibility system...");
+
+    /* Initialize TTS (Tolk screen reader library) */
+    if (!TTS_InitTolk()) {
         Accessibility_Log("Warning: TTS initialization failed\n");
         AccessibilitySettings.tts_enabled = 0;
     }
@@ -784,13 +990,17 @@ extern "C" void Accessibility_Shutdown(void)
         return;
     }
 
+    LOG_INF("=== Accessibility System Shutting Down ===");
+
     TTS_Stop();
-    TTS_ShutdownSAPI();
+    TTS_ShutdownTolk();
     RadarTone_Shutdown();
     PitchTone_Shutdown();
 
     g_AccessibilityInitialized = 0;
-    Accessibility_Log("Accessibility system shutdown\n");
+
+    LOG_INF("Accessibility system shutdown complete");
+    Log_Shutdown();
 }
 
 extern "C" int Accessibility_IsAvailable(void)
@@ -1058,14 +1268,15 @@ extern "C" void AudioRadar_AnnounceNearestThreat(void)
         }
     }
 
-    /* Play directional tone for nearest threat */
+    /* Play directional tone for nearest threat with enemy-specific pitch */
     if (nearestSB && nearestSB->DynPtr) {
         RadarTone_PlayDirectional(
             nearestSB->DynPtr->Position.vx,
             nearestSB->DynPtr->Position.vy,
             nearestSB->DynPtr->Position.vz,
             playerX, playerY, playerZ,
-            playerYaw
+            playerYaw,
+            nearestSB->I_SBtype  /* Pass entity type for distinct tone */
         );
     }
 }
@@ -1189,6 +1400,64 @@ extern "C" void PlayerState_Update(void)
         Announcement_RecordTime(ANNOUNCE_PRIORITY_NORMAL);
     }
 
+    /* ============================================
+     * Predator Equipment Tracking
+     * ============================================ */
+    if (AvP.PlayerType == I_Predator) {
+        /* Cloak state tracking */
+        int currentCloak = ps->cloakOn;
+        if (g_LastCloakOn >= 0 && currentCloak != g_LastCloakOn &&
+            Announcement_IsAllowed(ANNOUNCE_PRIORITY_NORMAL)) {
+            if (currentCloak) {
+                TTS_SpeakQueued("Cloak on.");
+            } else {
+                TTS_SpeakQueued("Cloak off.");
+            }
+            Announcement_RecordTime(ANNOUNCE_PRIORITY_NORMAL);
+        }
+        g_LastCloakOn = currentCloak;
+
+        /* Vision mode tracking */
+        int currentVision = (int)CurrentVisionMode;
+        if (g_LastVisionMode >= 0 && currentVision != g_LastVisionMode &&
+            Announcement_IsAllowed(ANNOUNCE_PRIORITY_NORMAL)) {
+            const char* modeName = "Normal vision";
+            switch (CurrentVisionMode) {
+                case VISION_MODE_NORMAL: modeName = "Normal vision"; break;
+                case VISION_MODE_PRED_THERMAL: modeName = "Thermal vision"; break;
+                case VISION_MODE_PRED_SEEALIENS: modeName = "Alien vision"; break;
+                case VISION_MODE_PRED_SEEPREDTECH: modeName = "Tech vision"; break;
+                default: modeName = "Vision mode changed"; break;
+            }
+            TTS_SpeakQueued(modeName);
+            Announcement_RecordTime(ANNOUNCE_PRIORITY_NORMAL);
+        }
+        g_LastVisionMode = currentVision;
+
+        /* Field charge (energy) tracking - announce on significant changes */
+        int currentChargePercent = (ps->FieldCharge * 100) / PLAYERCLOAK_MAXENERGY;
+        if (g_LastFieldChargePercent >= 0) {
+            /* Announce when crossing 25%, 50%, 75% thresholds or hitting low */
+            int lastQuarter = g_LastFieldChargePercent / 25;
+            int currentQuarter = currentChargePercent / 25;
+
+            if (currentQuarter != lastQuarter && currentChargePercent < g_LastFieldChargePercent &&
+                Announcement_IsAllowed(ANNOUNCE_PRIORITY_NORMAL)) {
+                char buffer[64];
+                if (currentChargePercent <= 10) {
+                    snprintf(buffer, sizeof(buffer), "Energy critical! %d percent.", currentChargePercent);
+                    TTS_SpeakPriority(buffer);
+                    Announcement_RecordTime(ANNOUNCE_PRIORITY_HIGH);
+                } else if (currentChargePercent <= 25) {
+                    snprintf(buffer, sizeof(buffer), "Energy low. %d percent.", currentChargePercent);
+                    TTS_SpeakQueued(buffer);
+                    Announcement_RecordTime(ANNOUNCE_PRIORITY_NORMAL);
+                }
+            }
+        }
+        g_LastFieldChargePercent = currentChargePercent;
+    }
+
     /* Update tracked values */
     g_LastHealth = currentHealth;
     g_LastArmor = currentArmor;
@@ -1219,6 +1488,30 @@ extern "C" void PlayerState_AnnounceArmor(void)
     char buffer[64];
     snprintf(buffer, sizeof(buffer), "Armor: %d percent", armor);
     TTS_Speak(buffer);
+}
+
+/* Announce Predator energy cell / field charge status */
+extern "C" void Accessibility_AnnounceEnergy(void)
+{
+    if (!Player || !Player->ObStrategyBlock) return;
+
+    PLAYER_STATUS* ps = (PLAYER_STATUS*)(Player->ObStrategyBlock->SBdataptr);
+    if (!ps) return;
+
+    char buffer[128];
+
+    /* Only Predator has energy cells */
+    if (AvP.PlayerType == I_Predator) {
+        int energyPercent = (ps->FieldCharge * 100) / PLAYERCLOAK_MAXENERGY;
+        snprintf(buffer, sizeof(buffer), "Energy: %d percent", energyPercent);
+        TTS_Speak(buffer);
+    } else if (AvP.PlayerType == I_Marine) {
+        /* Marines don't have energy cells */
+        TTS_Speak("Marines do not have energy cells.");
+    } else if (AvP.PlayerType == I_Alien) {
+        /* Aliens don't have energy cells */
+        TTS_Speak("Aliens do not have energy cells.");
+    }
 }
 
 extern "C" void PlayerState_AnnounceWeapon(void)
@@ -1467,6 +1760,10 @@ extern "C" void PitchIndicator_Update(void)
  * Menu Accessibility
  * ============================================ */
 
+/* Track when menu was last announced to prevent render hook from double-announcing */
+static unsigned int g_LastMenuAnnouncementTime = 0;
+#define MENU_ANNOUNCEMENT_COOLDOWN_MS 2000  /* Don't re-announce within 2 seconds */
+
 extern "C" void Menu_OnTextDisplayed(const char* text, int isSelected)
 {
     if (!Accessibility_IsAvailable() || !AccessibilitySettings.menu_narration_enabled) {
@@ -1475,12 +1772,26 @@ extern "C" void Menu_OnTextDisplayed(const char* text, int isSelected)
 
     if (!text || strlen(text) == 0) return;
 
+    /* Check cooldown - if explicit announcement was made recently, skip render hook */
+    unsigned int currentTime = GetTickCount();
+    if ((currentTime - g_LastMenuAnnouncementTime) < MENU_ANNOUNCEMENT_COOLDOWN_MS) {
+        return;  /* Recent explicit announcement, skip this render-triggered one */
+    }
+
     /* Only announce if text changed and is selected */
     if (isSelected && strcmp(text, g_LastMenuText) != 0) {
         TTS_Speak(text);
         strncpy(g_LastMenuText, text, sizeof(g_LastMenuText) - 1);
         g_LastMenuText[sizeof(g_LastMenuText) - 1] = '\0';
+        g_LastMenuAnnouncementTime = currentTime;
     }
+}
+
+/* Called by explicit menu announcement functions to set cooldown
+ * This prevents render hooks from double-announcing after explicit TTS */
+extern "C" void Menu_SetAnnouncementCooldown(void)
+{
+    g_LastMenuAnnouncementTime = GetTickCount();
 }
 
 extern "C" void Menu_AnnounceCurrentItem(void)
@@ -1662,6 +1973,79 @@ extern "C" void Accessibility_ProcessInput(void)
     /* Grave/Tilde (~) - Toggle obstruction alerts */
     if (DebouncedKeyboardInput[KEY_GRAVE]) {
         Obstruction_Toggle();
+    }
+
+    /* Tab - Environment description */
+    if (DebouncedKeyboardInput[KEY_TAB]) {
+        Environment_Describe();
+    }
+
+    /* H - Health announcement (all characters) */
+    if (DebouncedKeyboardInput[KEY_H]) {
+        PlayerState_AnnounceHealth();
+    }
+
+    /* C - Energy cell status (Predator only) */
+    if (DebouncedKeyboardInput[KEY_C]) {
+        Accessibility_AnnounceEnergy();
+    }
+
+    /* M - Mission objectives */
+    if (DebouncedKeyboardInput[KEY_M]) {
+        Mission_AnnounceObjectives();
+    }
+
+    /* ============================================
+     * IJKL / Numpad - Rotation and Vertical Look Control
+     * J/Numpad4 = Rotate Left, L/Numpad6 = Rotate Right
+     * I/Numpad8 = Look Up, K/Numpad2 = Look Down
+     * ============================================ */
+
+    /* Only process look keys when in-game (not in menus) */
+    if (Player && Player->ObStrategyBlock && Player->ObStrategyBlock->DynPtr) {
+        DYNAMICSBLOCK* playerDyn = Player->ObStrategyBlock->DynPtr;
+        PLAYER_STATUS* ps = (PLAYER_STATUS*)(Player->ObStrategyBlock->SBdataptr);
+
+        if (ps) {
+            /* J / Numpad4 - Rotate left */
+            if (KeyboardInput[KEY_J] || KeyboardInput[KEY_NUMPAD4]) {
+                playerDyn->AngVelocity.EulerY = -ARROW_ROTATION_SPEED;
+            }
+            /* L / Numpad6 - Rotate right */
+            else if (KeyboardInput[KEY_L] || KeyboardInput[KEY_NUMPAD6]) {
+                playerDyn->AngVelocity.EulerY = ARROW_ROTATION_SPEED;
+            }
+
+            /* I / Numpad8 - Look up */
+            if (KeyboardInput[KEY_I] || KeyboardInput[KEY_NUMPAD8]) {
+                ps->ViewPanX -= ARROW_PITCH_SPEED;
+                /* Clamp pitch to prevent extreme angles */
+                if (ps->ViewPanX < -1536) ps->ViewPanX = -1536;  /* Max look up */
+            }
+            /* K / Numpad2 - Look down */
+            else if (KeyboardInput[KEY_K] || KeyboardInput[KEY_NUMPAD2]) {
+                ps->ViewPanX += ARROW_PITCH_SPEED;
+                /* Clamp pitch to prevent extreme angles */
+                if (ps->ViewPanX > 1536) ps->ViewPanX = 1536;  /* Max look down */
+            }
+
+            /* Centering tone detection - play tone when pitch returns to center */
+            int currentPitchCentered = (ps->ViewPanX >= -PITCH_CENTER_THRESHOLD &&
+                                        ps->ViewPanX <= PITCH_CENTER_THRESHOLD);
+            unsigned int currentTime = GetTickCount();
+
+            /* If pitch was off-center and now it's centered, play centering tone */
+            if (g_WasPitchOffCenter && currentPitchCentered) {
+                /* Debounce: only play if 300ms since last centering tone */
+                if ((currentTime - g_LastCenteringToneTime) > 300) {
+                    CenteringTone_Play();
+                    g_LastCenteringToneTime = currentTime;
+                }
+            }
+
+            /* Update off-center tracking */
+            g_WasPitchOffCenter = !currentPitchCentered;
+        }
     }
 }
 
@@ -2228,8 +2612,11 @@ static int NavTone_Init(void)
     return 1;
 }
 
-/* Play navigation tone with stereo panning based on direction */
-static void NavTone_PlayDirectional(float angleOffset)
+/* Play navigation tone with stereo panning and vertical pitch variation
+ * angleOffset: -1.0 = hard left, 0 = center, 1.0 = hard right
+ * verticalRatio: -1.0 = below, 0 = same level, 1.0 = above
+ */
+static void NavTone_PlayDirectional(float angleOffset, float verticalRatio)
 {
     if (!g_NavToneInitialized) {
         if (!NavTone_Init()) return;
@@ -2242,7 +2629,6 @@ static void NavTone_PlayDirectional(float angleOffset)
         return;  /* Let current sound finish, don't interrupt */
     }
 
-    /* angleOffset: -1.0 = hard left, 0 = center, 1.0 = hard right */
     /* Use SOURCE_RELATIVE for consistent UI audio that doesn't interfere with game 3D sounds */
     alSourcei(g_NavToneSource, AL_SOURCE_RELATIVE, AL_TRUE);
 
@@ -2252,14 +2638,28 @@ static void NavTone_PlayDirectional(float angleOffset)
 
     alSource3f(g_NavToneSource, AL_POSITION, posX, 0.0f, posZ);
 
-    /* Higher pitch when closer to center (on target) */
+    /* Calculate pitch based on both horizontal alignment AND vertical offset:
+     * - Base pitch 1.0
+     * - Higher when on target horizontally (+0.15 to +0.3)
+     * - Vertical variation: above = higher pitch, below = lower pitch (+/- 0.5)
+     */
     float pitch = 1.0f;
+
+    /* Horizontal alignment bonus */
     float absAngle = (angleOffset < 0) ? -angleOffset : angleOffset;
     if (absAngle < 0.1f) {
-        pitch = 1.3f;  /* Higher pitch when on target */
+        pitch += 0.3f;  /* Higher pitch when on target */
     } else if (absAngle < 0.3f) {
-        pitch = 1.15f;
+        pitch += 0.15f;
     }
+
+    /* Vertical variation: above = higher pitch, below = lower pitch */
+    pitch += verticalRatio * 0.5f;
+
+    /* Clamp pitch to reasonable range */
+    if (pitch < 0.5f) pitch = 0.5f;
+    if (pitch > 2.0f) pitch = 2.0f;
+
     alSourcef(g_NavToneSource, AL_PITCH, pitch);
 
     /* Set a moderate gain that won't overpower game sounds */
@@ -2280,6 +2680,267 @@ extern "C" void AutoNav_Init(void)
     AutoNavState.target_z = 0;
     AutoNavState.target_distance = 0;
     AutoNavState.target_name = NULL;
+
+    /* Initialize position history */
+    AutoNavState.history_index = 0;
+    AutoNavState.history_count = 0;
+    memset(AutoNavState.position_history, 0, sizeof(AutoNavState.position_history));
+
+    /* Initialize progress tracking */
+    AutoNavState.last_announced_distance = 0;
+    AutoNavState.closest_achieved = 999999;
+    AutoNavState.last_progress_time = 0;
+
+    /* Initialize strategy management */
+    AutoNavState.current_strategy = NAV_STRATEGY_DIRECT;
+    AutoNavState.strategy_frames = 0;
+    AutoNavState.strategy_failures = 0;
+
+    /* Initialize door/lift tracking */
+    AutoNavState.door_wait.doorSB = NULL;
+    AutoNavState.door_wait.lastState = 0;
+    AutoNavState.door_wait.waitStartTime = 0;
+    AutoNavState.door_wait.announced = 0;
+    AutoNavState.lift_track.liftSB = NULL;
+    AutoNavState.lift_track.lastState = 0;
+    AutoNavState.lift_track.playerOnLift = 0;
+    AutoNavState.lift_track.rideStartTime = 0;
+
+    /* Initialize arrival handling */
+    AutoNavState.arrival_announced = 0;
+    AutoNavState.target_reached = 0;
+}
+
+/* ============================================
+ * Spatial Awareness State
+ * ============================================ */
+
+SPATIAL_AWARENESS_STATE SpatialState = {0};
+
+/* ============================================
+ * Pathfinding Helper Functions
+ * ============================================ */
+
+/* Record current position in history (call every 10 frames) */
+extern "C" void PathFind_RecordPosition(int x, int y, int z)
+{
+    POSITION_RECORD* rec = &AutoNavState.position_history[AutoNavState.history_index];
+    rec->x = x;
+    rec->y = y;
+    rec->z = z;
+    rec->timestamp = GetTickCount();
+
+    AutoNavState.history_index = (AutoNavState.history_index + 1) % NAV_POSITION_HISTORY_SIZE;
+    if (AutoNavState.history_count < NAV_POSITION_HISTORY_SIZE) {
+        AutoNavState.history_count++;
+    }
+}
+
+/* Detect if player is oscillating (moving back and forth) */
+extern "C" int PathFind_DetectOscillation(void)
+{
+    if (AutoNavState.history_count < 6) return 0;
+
+    /* Look at last 6 positions (~1 second) */
+    int sumX = 0, sumZ = 0;
+    int sumX2 = 0, sumZ2 = 0;
+    int count = 0;
+
+    for (int i = 0; i < 6; i++) {
+        int idx = (AutoNavState.history_index - 1 - i + NAV_POSITION_HISTORY_SIZE) % NAV_POSITION_HISTORY_SIZE;
+        POSITION_RECORD* rec = &AutoNavState.position_history[idx];
+        sumX += rec->x;
+        sumZ += rec->z;
+        sumX2 += rec->x * rec->x;
+        sumZ2 += rec->z * rec->z;
+        count++;
+    }
+
+    /* Calculate variance */
+    int meanX = sumX / count;
+    int meanZ = sumZ / count;
+    int varX = (sumX2 / count) - (meanX * meanX);
+    int varZ = (sumZ2 / count) - (meanZ * meanZ);
+
+    /* Low variance in position but movement detected = oscillating */
+    /* Check if total movement is significant but variance is low */
+    int oldest = (AutoNavState.history_index - 6 + NAV_POSITION_HISTORY_SIZE) % NAV_POSITION_HISTORY_SIZE;
+    int newest = (AutoNavState.history_index - 1 + NAV_POSITION_HISTORY_SIZE) % NAV_POSITION_HISTORY_SIZE;
+    int dx = AutoNavState.position_history[newest].x - AutoNavState.position_history[oldest].x;
+    int dz = AutoNavState.position_history[newest].z - AutoNavState.position_history[oldest].z;
+    int totalMovement = dx * dx + dz * dz;
+
+    /* Oscillating if variance is high (lots of back-and-forth) but net movement is low */
+    if ((varX + varZ) > 500000 && totalMovement < 1000000) {
+        return 1;
+    }
+
+    return 0;
+}
+
+/* Detect if player has returned to a previous position (loop) */
+extern "C" int PathFind_DetectLoop(int* loopSize)
+{
+    if (AutoNavState.history_count < 18) return 0;  /* Need 3+ seconds of history */
+
+    int currentIdx = (AutoNavState.history_index - 1 + NAV_POSITION_HISTORY_SIZE) % NAV_POSITION_HISTORY_SIZE;
+    POSITION_RECORD* current = &AutoNavState.position_history[currentIdx];
+
+    /* Check positions from 3+ seconds ago */
+    for (int i = 18; i < AutoNavState.history_count; i++) {
+        int oldIdx = (AutoNavState.history_index - 1 - i + NAV_POSITION_HISTORY_SIZE) % NAV_POSITION_HISTORY_SIZE;
+        POSITION_RECORD* old = &AutoNavState.position_history[oldIdx];
+
+        int dx = current->x - old->x;
+        int dz = current->z - old->z;
+        int distSq = dx * dx + dz * dz;
+
+        /* Within 1000 units = same position (loop detected) */
+        if (distSq < 1000000) {
+            if (loopSize) *loopSize = i;
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+/* Escalate to next navigation strategy */
+extern "C" void PathFind_EscalateStrategy(void)
+{
+    AutoNavState.strategy_frames = 0;
+
+    switch (AutoNavState.current_strategy) {
+        case NAV_STRATEGY_DIRECT:
+            AutoNavState.current_strategy = NAV_STRATEGY_WALL_FOLLOW_LEFT;
+            TTS_SpeakQueued("Trying wall follow left.");
+            LOG_INF("Strategy: Wall follow left");
+            break;
+
+        case NAV_STRATEGY_WALL_FOLLOW_LEFT:
+            AutoNavState.current_strategy = NAV_STRATEGY_WALL_FOLLOW_RIGHT;
+            TTS_SpeakQueued("Trying wall follow right.");
+            LOG_INF("Strategy: Wall follow right");
+            break;
+
+        case NAV_STRATEGY_WALL_FOLLOW_RIGHT:
+            AutoNavState.current_strategy = NAV_STRATEGY_BACKTRACK;
+            TTS_SpeakQueued("Backing up.");
+            LOG_INF("Strategy: Backtrack");
+            break;
+
+        case NAV_STRATEGY_BACKTRACK:
+            /* After backtrack, try wide around */
+            AutoNavState.current_strategy = NAV_STRATEGY_WIDE_AROUND_LEFT;
+            TTS_SpeakQueued("Trying wide path left.");
+            LOG_INF("Strategy: Wide around left");
+            break;
+
+        case NAV_STRATEGY_WIDE_AROUND_LEFT:
+            AutoNavState.current_strategy = NAV_STRATEGY_WIDE_AROUND_RIGHT;
+            TTS_SpeakQueued("Trying wide path right.");
+            LOG_INF("Strategy: Wide around right");
+            break;
+
+        case NAV_STRATEGY_WIDE_AROUND_RIGHT:
+            /* All strategies exhausted */
+            AutoNavState.strategy_failures++;
+            if (AutoNavState.strategy_failures >= 2) {
+                TTS_Speak("Cannot reach target. Try manual navigation.");
+                AutoNavState.auto_move = 0;
+                AutoNavState.current_strategy = NAV_STRATEGY_DIRECT;
+                LOG_WRN("All navigation strategies failed");
+            } else {
+                /* Reset and try again */
+                AutoNavState.current_strategy = NAV_STRATEGY_DIRECT;
+                TTS_SpeakQueued("Retrying direct path.");
+                LOG_INF("Strategy: Reset to direct");
+            }
+            break;
+    }
+}
+
+/* ============================================
+ * Progress and Arrival Functions
+ * ============================================ */
+
+#define PROGRESS_ANNOUNCE_DISTANCE 5000   /* 5 meters */
+#define PROGRESS_ANNOUNCE_TIME_MS 10000   /* 10 seconds */
+#define PROGRESS_MOVING_AWAY_THRESHOLD 3000  /* 3 meters */
+#define ARRIVAL_DISTANCE 2500  /* 2.5 meters */
+
+extern "C" void AutoNav_CheckProgress(void)
+{
+    if (!AutoNavState.enabled || !AutoNavState.auto_move) return;
+
+    int currentDist = AutoNavState.target_distance;
+    int lastDist = AutoNavState.last_announced_distance;
+    unsigned int now = GetTickCount();
+
+    /* Update closest achieved */
+    if (currentDist < AutoNavState.closest_achieved) {
+        AutoNavState.closest_achieved = currentDist;
+    }
+
+    /* Check if making progress */
+    int distanceChange = lastDist - currentDist;  /* Positive = getting closer */
+    unsigned int timeSince = now - AutoNavState.last_progress_time;
+
+    if (distanceChange >= PROGRESS_ANNOUNCE_DISTANCE) {
+        /* Announce distance milestone */
+        char msg[64];
+        int meters = currentDist / 1000;
+        if (meters > 0) {
+            snprintf(msg, sizeof(msg), "%d meters.", meters);
+            TTS_SpeakQueued(msg);
+        }
+        AutoNavState.last_announced_distance = currentDist;
+        AutoNavState.last_progress_time = now;
+        LOG_INF("Progress: %d meters to target", meters);
+    }
+    else if (distanceChange <= -PROGRESS_MOVING_AWAY_THRESHOLD && timeSince > 5000) {
+        /* Moving away from target */
+        TTS_SpeakQueued("Moving away from target.");
+        AutoNavState.last_announced_distance = currentDist;
+        AutoNavState.last_progress_time = now;
+        LOG_INF("Moving away from target");
+    }
+    else if (timeSince > PROGRESS_ANNOUNCE_TIME_MS && abs(distanceChange) < 2000) {
+        /* No significant progress in 10 seconds */
+        TTS_SpeakQueued("Navigation stalled.");
+        AutoNavState.last_progress_time = now;
+        LOG_WRN("Navigation stalled");
+    }
+}
+
+extern "C" void AutoNav_CheckArrival(void)
+{
+    if (!AutoNavState.enabled) return;
+    if (AutoNavState.arrival_announced) return;
+    if (AutoNavState.target_distance >= ARRIVAL_DISTANCE) return;
+
+    /* Build contextual announcement */
+    char msg[128];
+
+    if (AutoNavState.target_type == NAV_TARGET_INTERACTIVE) {
+        snprintf(msg, sizeof(msg), "Arrived at %s. Press SPACE to interact.",
+                 AutoNavState.target_name ? AutoNavState.target_name : "target");
+    }
+    else if (AutoNavState.target_type == NAV_TARGET_ITEM) {
+        snprintf(msg, sizeof(msg), "Item nearby. Walk forward to collect.");
+    }
+    else {
+        snprintf(msg, sizeof(msg), "Target reached.");
+    }
+
+    TTS_Speak(msg);
+    AutoNavState.arrival_announced = 1;
+    AutoNavState.target_reached = 1;
+
+    /* Disable auto-move on arrival */
+    AutoNavState.auto_move = 0;
+
+    LOG_INF("Arrived at target: %s", AutoNavState.target_name ? AutoNavState.target_name : "unknown");
 }
 
 /* Get name for target type */
@@ -2302,7 +2963,11 @@ static int IsNavTarget(AVP_BEHAVIOUR_TYPE bhvr, NAV_TARGET_TYPE targetType)
             return (bhvr == I_BehaviourBinarySwitch ||
                     bhvr == I_BehaviourLinkSwitch ||
                     bhvr == I_BehaviourDatabase ||
-                    bhvr == I_BehaviourLift);
+                    bhvr == I_BehaviourLift ||
+                    bhvr == I_BehaviourProximityDoor ||
+                    bhvr == I_BehaviourLiftDoor ||
+                    bhvr == I_BehaviourSwitchDoor ||
+                    bhvr == I_BehaviourGenerator);
 
         case NAV_TARGET_NPC:
             return (bhvr == I_BehaviourAlien ||
@@ -2370,6 +3035,7 @@ extern "C" void AutoNav_FindTarget(void)
     extern int NumActiveStBlocks;
     extern STRATEGYBLOCK* ActiveStBlockList[];
 
+    int bestScore = 999999999;
     int nearestDist = 999999999;
     STRATEGYBLOCK* nearestSB = NULL;
 
@@ -2386,7 +3052,28 @@ extern "C" void AutoNav_FindTarget(void)
             sb->DynPtr->Position.vz
         );
 
-        if (dist < nearestDist) {
+        /* Score-based prioritization (lower is better):
+         * - Threats get -5000 priority bonus
+         * - Interactive elements get -2000 bonus
+         * This makes closer threats/interactives preferred over distant ones */
+        int score = dist;
+        if (IsEntityThreat(sb->I_SBtype, AvP.PlayerType)) {
+            score -= 5000;  /* Prioritize threats */
+        }
+        if (sb->I_SBtype == I_BehaviourBinarySwitch ||
+            sb->I_SBtype == I_BehaviourLinkSwitch ||
+            sb->I_SBtype == I_BehaviourDatabase ||
+            sb->I_SBtype == I_BehaviourGenerator) {
+            score -= 2000;  /* Prioritize mission-relevant interactives */
+        }
+        if (sb->I_SBtype == I_BehaviourProximityDoor ||
+            sb->I_SBtype == I_BehaviourLiftDoor ||
+            sb->I_SBtype == I_BehaviourSwitchDoor) {
+            score -= 1500;  /* Prioritize doors slightly less than switches */
+        }
+
+        if (score < bestScore) {
+            bestScore = score;
             nearestDist = dist;
             nearestSB = sb;
         }
@@ -2398,9 +3085,13 @@ extern "C" void AutoNav_FindTarget(void)
         AutoNavState.target_z = nearestSB->DynPtr->Position.vz;
         AutoNavState.target_distance = nearestDist;
         AutoNavState.target_name = GetNavTargetName(nearestSB->I_SBtype);
+        LOG_DBG("AutoNav: Found target '%s' at dist=%d pos=(%d,%d,%d)",
+                AutoNavState.target_name, nearestDist,
+                AutoNavState.target_x, AutoNavState.target_y, AutoNavState.target_z);
     } else {
         AutoNavState.target_name = NULL;
         AutoNavState.target_distance = 0;
+        LOG_DBG("AutoNav: No target found for type %d", AutoNavState.target_type);
     }
 }
 
@@ -2509,6 +3200,16 @@ extern "C" void AutoNav_CycleTargetType(void)
     }
 }
 
+/* Forward declarations for structure identification system (defined later) */
+typedef struct {
+    int distance;           /* Distance to hit (0 if no hit) */
+    DISPLAYBLOCK* hitObj;   /* Object that was hit (NULL for world geometry) */
+    const char* typeName;   /* Friendly name for what was hit */
+} RAY_RESULT;
+
+static RAY_RESULT CastObstructionRayEx(VECTORCH* origin, VECTORCH* direction, int maxRange);
+static const char* GetObstacleTypeName(DISPLAYBLOCK* obj);
+
 extern "C" void AutoNav_Update(void)
 {
     if (!AutoNavState.enabled || !Accessibility_IsAvailable()) {
@@ -2535,19 +3236,48 @@ extern "C" void AutoNav_Update(void)
     int playerY = playerDyn->Position.vy;
     int playerZ = playerDyn->Position.vz;
 
-    /* Calculate direction to target */
+    /* Record position every 10 frames for loop detection */
+    static int positionRecordCounter = 0;
+    positionRecordCounter++;
+    if (positionRecordCounter >= 10) {
+        positionRecordCounter = 0;
+        PathFind_RecordPosition(playerX, playerY, playerZ);
+    }
+
+    /* Increment strategy frame counter */
+    AutoNavState.strategy_frames++;
+
+    /* Check progress toward target (every 60 frames) */
+    static int progressCheckCounter = 0;
+    progressCheckCounter++;
+    if (progressCheckCounter >= 60) {
+        progressCheckCounter = 0;
+        AutoNav_CheckProgress();
+    }
+
+    /* Calculate direction to target (including vertical) */
     float dx = (float)(AutoNavState.target_x - playerX);
+    float dy = (float)(AutoNavState.target_y - playerY);
     float dz = (float)(AutoNavState.target_z - playerZ);
 
     /* Get player's forward direction from orientation matrix */
     float forwardX = (float)playerDyn->OrientMat.mat31 / 65536.0f;
     float forwardZ = (float)playerDyn->OrientMat.mat33 / 65536.0f;
 
-    /* Normalize direction to target */
+    /* Normalize direction to target (horizontal) */
     float targetDist = sqrtf(dx*dx + dz*dz);
     if (targetDist < 1.0f) targetDist = 1.0f;
     float targetDirX = dx / targetDist;
     float targetDirZ = dz / targetDist;
+
+    /* Calculate 3D distance for vertical ratio */
+    float dist3D = sqrtf(dx*dx + dy*dy + dz*dz);
+    float verticalRatio = 0.0f;
+    if (dist3D > 1.0f) {
+        verticalRatio = dy / dist3D;  /* -1 to 1: negative = below, positive = above */
+        if (verticalRatio > 1.0f) verticalRatio = 1.0f;
+        if (verticalRatio < -1.0f) verticalRatio = -1.0f;
+    }
 
     /* Calculate cross product to determine left/right */
     float cross = forwardX * targetDirZ - forwardZ * targetDirX;
@@ -2565,12 +3295,12 @@ extern "C" void AutoNav_Update(void)
         angleOffset = (cross >= 0) ? 1.0f : -1.0f;
     }
 
-    /* Play navigation tone every 20 frames */
+    /* Play navigation tone every 20 frames with vertical pitch variation */
     static int toneCounter = 0;
     toneCounter++;
     if (toneCounter >= 20) {
         toneCounter = 0;
-        NavTone_PlayDirectional(angleOffset);
+        NavTone_PlayDirectional(angleOffset, verticalRatio);
     }
 
     /* ============================================
@@ -2578,10 +3308,11 @@ extern "C" void AutoNav_Update(void)
      * ============================================ */
 
     /* Cast a ray toward target to check for obstacles */
-    static int avoidanceState = 0;  /* 0=none, 1=avoiding left, 2=avoiding right */
+    static int avoidanceState = 0;  /* 0=none, 1=avoiding left, 2=avoiding right, 3=waiting at door */
     static int avoidanceTimer = 0;
     static int stuckCounter = 0;
     static int lastPlayerX = 0, lastPlayerZ = 0;
+    static int doorAnnouncedThisStop = 0;
 
     VECTORCH rayOrigin = playerDyn->Position;
     rayOrigin.vy -= 800;  /* Chest height */
@@ -2591,30 +3322,77 @@ extern "C" void AutoNav_Update(void)
     targetDir.vy = 0;
     targetDir.vz = (int)(targetDirZ * ONE_FIXED);
 
-    int obstacleDistance = 0;
-    LOS_ObjectHitPtr = NULL;
-    LOS_Lambda = 8000;  /* Check 8 meters ahead */
-    FindPolygonInLineOfSight(&targetDir, &rayOrigin, 0, Player);
+    /* Use extended ray cast for structure identification */
+    RAY_RESULT obstacleResult = CastObstructionRayEx(&rayOrigin, &targetDir, 8000);
+    int obstacleDistance = obstacleResult.distance;
+    const char* obstacleType = obstacleResult.typeName;
 
-    if (LOS_ObjectHitPtr != NULL || LOS_Lambda < 8000) {
-        obstacleDistance = LOS_Lambda;
-    }
+    /* Check if obstacle is a door - STOP and announce */
+    int isDoor = (strcmp(obstacleType, "door") == 0 ||
+                  strcmp(obstacleType, "proximity door") == 0 ||
+                  strcmp(obstacleType, "lift door") == 0);
 
-    /* Stuck detection - if we haven't moved much in a while */
+    int isEnemy = (strcmp(obstacleType, "alien") == 0 ||
+                   strcmp(obstacleType, "queen alien") == 0 ||
+                   strcmp(obstacleType, "facehugger") == 0 ||
+                   strcmp(obstacleType, "predator") == 0 ||
+                   strcmp(obstacleType, "xenoborg") == 0 ||
+                   strcmp(obstacleType, "marine") == 0);
+
+    /* Enhanced stuck detection using position history */
     int movedX = playerX - lastPlayerX;
     int movedZ = playerZ - lastPlayerZ;
     int distMoved = (movedX * movedX + movedZ * movedZ);
 
-    if (AutoNavState.auto_move && distMoved < 10000) {  /* Barely moved - threshold increased to reduce false positives */
-        stuckCounter++;
-        if (stuckCounter > 90) {  /* Stuck for ~1.5 seconds */
-            /* Try reversing avoidance direction */
-            avoidanceState = (avoidanceState == 1) ? 2 : 1;
+    if (AutoNavState.auto_move && !AutoNavState.target_reached) {
+        /* Check for oscillation (back-and-forth movement) */
+        int loopSize = 0;
+        int isOscillating = PathFind_DetectOscillation();
+        int isLooping = PathFind_DetectLoop(&loopSize);
+
+        /* Simple stuck check (barely moving) */
+        if (distMoved < 10000) {
+            stuckCounter++;
+        } else {
             stuckCounter = 0;
-            if (Announcement_IsAllowed(ANNOUNCE_PRIORITY_NORMAL)) {
-                TTS_SpeakQueued("Rerouting.");
-                Announcement_RecordTime(ANNOUNCE_PRIORITY_NORMAL);
+        }
+
+        /* Escalate strategy if stuck, oscillating, or looping */
+        if (stuckCounter > 90) {  /* Stuck for ~1.5 seconds */
+            LOG_INF("AutoNav: Stuck detected (stuckCounter=%d), escalating strategy", stuckCounter);
+            PathFind_EscalateStrategy();
+            stuckCounter = 0;
+
+            /* Apply strategy-specific behavior to avoidance state */
+            switch (AutoNavState.current_strategy) {
+                case NAV_STRATEGY_WALL_FOLLOW_LEFT:
+                    avoidanceState = 1;  /* Force left */
+                    avoidanceTimer = 180;  /* 3 seconds */
+                    break;
+                case NAV_STRATEGY_WALL_FOLLOW_RIGHT:
+                    avoidanceState = 2;  /* Force right */
+                    avoidanceTimer = 180;
+                    break;
+                case NAV_STRATEGY_BACKTRACK:
+                    avoidanceState = 0;  /* Will be handled separately */
+                    break;
+                case NAV_STRATEGY_WIDE_AROUND_LEFT:
+                    avoidanceState = 1;
+                    avoidanceTimer = 300;  /* 5 seconds */
+                    break;
+                case NAV_STRATEGY_WIDE_AROUND_RIGHT:
+                    avoidanceState = 2;
+                    avoidanceTimer = 300;
+                    break;
+                default:
+                    break;
             }
+        } else if (isOscillating) {
+            LOG_INF("AutoNav: Oscillation detected, escalating strategy");
+            PathFind_EscalateStrategy();
+        } else if (isLooping && loopSize > 0) {
+            LOG_INF("AutoNav: Loop detected (size=%d), escalating strategy", loopSize);
+            PathFind_EscalateStrategy();
         }
     } else {
         stuckCounter = 0;
@@ -2628,9 +3406,30 @@ extern "C" void AutoNav_Update(void)
     int shouldStrafeRight = 0;
     int adjustedTurnAmount = 0;
 
-    if (obstacleDistance > 0 && obstacleDistance < 4000) {
+    /* Handle doors specially - STOP and announce */
+    if (isDoor && obstacleDistance > 0 && obstacleDistance < 3000) {
+        /* Door ahead - stop and announce */
+        avoidanceState = 3;  /* Waiting at door */
+        shouldMoveForward = 0;
+
+        if (!doorAnnouncedThisStop) {
+            char doorMsg[128];
+            snprintf(doorMsg, sizeof(doorMsg), "%s ahead. Press SPACE to open.",
+                    obstacleType);
+            if (doorMsg[0] >= 'a' && doorMsg[0] <= 'z') doorMsg[0] -= 32;
+            TTS_SpeakQueued(doorMsg);
+            LOG_INF("AutoNav: Stopped at %s (dist=%d)", obstacleType, obstacleDistance);
+            doorAnnouncedThisStop = 1;
+        }
+    } else if (obstacleDistance > 0 && obstacleDistance < 4000) {
+        /* Reset door announcement flag when not near a door */
+        doorAnnouncedThisStop = 0;
+
         /* Obstacle in the way - need to avoid */
-        if (avoidanceState == 0) {
+        /* Enemies get tighter avoidance threshold */
+        int avoidThreshold = isEnemy ? 5000 : 4000;
+
+        if (avoidanceState == 0 || avoidanceState == 3) {  /* Not currently avoiding, or was waiting at door */
             /* Start avoidance - check which way has more room */
             VECTORCH leftDir, rightDir;
             leftDir.vx = -playerDyn->OrientMat.mat11;
@@ -2660,6 +3459,8 @@ extern "C" void AutoNav_Update(void)
                 avoidanceState = (leftClear > rightClear) ? 1 : 2;
             }
             avoidanceTimer = 30;  /* Avoid for ~0.5 seconds */
+            LOG_DBG("AutoNav: Obstacle at %d, avoiding %s (L=%d R=%d)",
+                    obstacleDistance, avoidanceState == 1 ? "LEFT" : "RIGHT", leftClear, rightClear);
         }
 
         /* Execute avoidance */
@@ -2685,6 +3486,7 @@ extern "C" void AutoNav_Update(void)
     } else if (obstacleDistance == 0 || obstacleDistance >= 4000) {
         /* No obstacle - clear avoidance state */
         avoidanceState = 0;
+        doorAnnouncedThisStop = 0;  /* Reset door announcement flag */
 
         /* Auto-rotation: gradually turn toward target */
         if (AutoNavState.auto_rotate && targetDist > 2000) {
@@ -2702,17 +3504,40 @@ extern "C" void AutoNav_Update(void)
         }
     }
 
-    /* Apply rotation */
+    /* Apply rotation with smoothing (lerp toward target turn rate) */
     if (AutoNavState.auto_rotate) {
-        playerDyn->AngVelocity.EulerY = adjustedTurnAmount;
+        static int smoothedTurnAmount = 0;
+        /* Lerp factor: 0.15 = smooth, responsive turning */
+        int diff = adjustedTurnAmount - smoothedTurnAmount;
+        smoothedTurnAmount += (int)(diff * 0.15f);
+        playerDyn->AngVelocity.EulerY = smoothedTurnAmount;
     }
 
     /* Apply movement - use SLOWER speed for better control during autonavigation */
     /* Normal speed is 32768, we use ~40% speed (13000) for more precise navigation */
     #define AUTONAV_FORWARD_SPEED 13000   /* Slower forward movement */
     #define AUTONAV_STRAFE_SPEED 8000     /* Slower strafe movement */
+    #define AUTONAV_BACKTRACK_SPEED -8000 /* Backward movement for backtrack strategy */
+    #define BACKTRACK_DURATION_FRAMES 90  /* ~1.5 seconds of backing up */
 
-    if (AutoNavState.auto_move && targetDist > 3000) {
+    /* Handle BACKTRACK strategy specially - move backward */
+    static int backtrackFrames = 0;
+    if (AutoNavState.current_strategy == NAV_STRATEGY_BACKTRACK) {
+        backtrackFrames++;
+        PLAYER_STATUS* ps = (PLAYER_STATUS*)(Player->ObStrategyBlock->SBdataptr);
+        if (ps) {
+            ps->Mvt_MotionIncrement = AUTONAV_BACKTRACK_SPEED;  /* Move backward */
+            ps->Mvt_SideStepIncrement = 0;
+        }
+        /* After backing up enough, reset to direct strategy */
+        if (backtrackFrames > BACKTRACK_DURATION_FRAMES) {
+            AutoNavState.current_strategy = NAV_STRATEGY_DIRECT;
+            AutoNavState.strategy_frames = 0;
+            backtrackFrames = 0;
+            LOG_INF("AutoNav: Backtrack complete, returning to direct strategy");
+        }
+    } else if (AutoNavState.auto_move && targetDist > 3000) {
+        backtrackFrames = 0;  /* Reset backtrack counter */
         PLAYER_STATUS* ps = (PLAYER_STATUS*)(Player->ObStrategyBlock->SBdataptr);
         if (ps) {
             if (shouldMoveForward) {
@@ -2746,17 +3571,8 @@ extern "C" void AutoNav_Update(void)
         }
     }
 
-    /* Check if reached target */
-    static int arrivedAnnounced = 0;
-    if (targetDist < 3000) {
-        if (!arrivedAnnounced && Announcement_IsAllowed(ANNOUNCE_PRIORITY_NORMAL)) {
-            TTS_SpeakQueued("Target reached.");
-            Announcement_RecordTime(ANNOUNCE_PRIORITY_NORMAL);
-            arrivedAnnounced = 1;
-        }
-    } else {
-        arrivedAnnounced = 0;
-    }
+    /* Check arrival using the enhanced arrival detection */
+    AutoNav_CheckArrival();
 }
 
 /* ============================================
@@ -2774,6 +3590,124 @@ extern "C" void AutoNav_Update(void)
 /* Note: OBSTRUCTION_STATE struct and g_ObstructionState are defined earlier in the file
  * near the other global state variables, so AutoNav can access them */
 
+/* ============================================
+ * Structure Identification System
+ * ============================================ */
+
+/* Get a friendly name for an obstacle based on its behavior type or geometry */
+static const char* GetObstacleTypeName(DISPLAYBLOCK* obj)
+{
+    if (!obj) return "wall";
+
+    /* If the object has a strategy block, identify by behavior type */
+    if (obj->ObStrategyBlock) {
+        AVP_BEHAVIOUR_TYPE bhvr = obj->ObStrategyBlock->I_SBtype;
+
+        switch (bhvr) {
+            /* Enemies */
+            case I_BehaviourAlien:
+            case I_BehaviourPredatorAlien:
+                return "alien";
+            case I_BehaviourQueenAlien:
+                return "queen alien";
+            case I_BehaviourFaceHugger:
+                return "facehugger";
+            case I_BehaviourPredator:
+            case I_BehaviourDormantPredator:
+                return "predator";
+            case I_BehaviourXenoborg:
+                return "xenoborg";
+            case I_BehaviourMarine:
+            case I_BehaviourSeal:
+                return "marine";
+            case I_BehaviourAutoGun:
+                return "autogun";
+
+            /* Doors */
+            case I_BehaviourProximityDoor:
+                return "proximity door";
+            case I_BehaviourLiftDoor:
+                return "lift door";
+            case I_BehaviourSwitchDoor:
+                return "door";
+
+            /* Interactive */
+            case I_BehaviourBinarySwitch:
+            case I_BehaviourLinkSwitch:
+                return "switch";
+            case I_BehaviourLift:
+            case I_BehaviourPlatform:
+                return "lift";
+            case I_BehaviourGenerator:
+                return "generator";
+            case I_BehaviourDatabase:
+                return "terminal";
+            case I_BehaviourPowerCable:
+                return "power cable";
+            case I_BehaviourFan:
+                return "fan";
+            case I_BehaviourDeathVolume:
+                return "hazard";
+            case I_BehaviourSelfDestruct:
+                return "self-destruct console";
+
+            /* Projectiles (shouldn't hit these usually) */
+            case I_BehaviourGrenade:
+            case I_BehaviourPulseGrenade:
+            case I_BehaviourFlareGrenade:
+            case I_BehaviourFragmentationGrenade:
+            case I_BehaviourProximityGrenade:
+            case I_BehaviourClusterGrenade:
+                return "grenade";
+            case I_BehaviourRocket:
+                return "rocket";
+
+            /* Objects */
+            case I_BehaviourInanimateObject:
+                return "object";
+            case I_BehaviourFragment:
+            case I_BehaviourHierarchicalFragment:
+            case I_BehaviourAlienFragment:
+                return "debris";
+            case I_BehaviourNetCorpse:
+                return "corpse";
+
+            /* Placed items */
+            case I_BehaviourPlacedHierarchy:
+            case I_BehaviourPlacedLight:
+                return "structure";
+            case I_BehaviourVideoScreen:
+                return "screen";
+            case I_BehaviourTrackObject:
+                return "track";
+
+            default:
+                break;
+        }
+    }
+
+    /* No strategy block or unknown type - analyze geometry if we have shape data */
+    if (obj->ObShapeData) {
+        /* Get shape extents */
+        int minX = obj->ObShapeData->shaperadius;  /* Use radius as approximation */
+        int maxExtent = minX * 2;  /* Diameter */
+
+        /* Very rough classification by size */
+        if (maxExtent < 1000) {
+            return "small object";
+        } else if (maxExtent < 3000) {
+            return "crate";
+        } else if (maxExtent < 6000) {
+            return "pillar";
+        }
+    }
+
+    /* Default to wall for static geometry */
+    return "wall";
+}
+
+/* Note: RAY_RESULT typedef is declared earlier (before AutoNav_Update) for forward reference */
+
 /* Cast a ray in a direction and return distance to hit (0 if no hit) */
 static int CastObstructionRay(VECTORCH* origin, VECTORCH* direction, int maxRange)
 {
@@ -2785,9 +3719,32 @@ static int CastObstructionRay(VECTORCH* origin, VECTORCH* direction, int maxRang
     FindPolygonInLineOfSight(direction, origin, 0, Player);
 
     if (LOS_ObjectHitPtr != NULL || LOS_Lambda < maxRange) {
+        LOG_DBG("Ray hit at distance %d (obj=%p)", LOS_Lambda, (void*)LOS_ObjectHitPtr);
         return LOS_Lambda;
     }
     return 0;  /* No obstruction within range */
+}
+
+/* Cast a ray and return detailed result including what was hit */
+static RAY_RESULT CastObstructionRayEx(VECTORCH* origin, VECTORCH* direction, int maxRange)
+{
+    RAY_RESULT result = {0, NULL, "clear"};
+
+    /* Initialize LOS globals */
+    LOS_ObjectHitPtr = NULL;
+    LOS_Lambda = maxRange;
+
+    /* Cast the ray */
+    FindPolygonInLineOfSight(direction, origin, 0, Player);
+
+    if (LOS_ObjectHitPtr != NULL || LOS_Lambda < maxRange) {
+        result.distance = LOS_Lambda;
+        result.hitObj = LOS_ObjectHitPtr;
+        result.typeName = GetObstacleTypeName(LOS_ObjectHitPtr);
+        LOG_DBG("RayEx hit '%s' at distance %d", result.typeName, result.distance);
+    }
+
+    return result;
 }
 
 /* Analyze an obstruction to determine if it's jumpable */
@@ -2954,7 +3911,84 @@ extern "C" void Obstruction_Update(void)
     }
 }
 
-/* Announce current obstruction status (on-demand via hotkey) */
+/* Check if a type is an interactive object that can be operated */
+static int IsInteractiveType(const char* typeName)
+{
+    return (strcmp(typeName, "door") == 0 ||
+            strcmp(typeName, "proximity door") == 0 ||
+            strcmp(typeName, "lift door") == 0 ||
+            strcmp(typeName, "switch") == 0 ||
+            strcmp(typeName, "lift") == 0 ||
+            strcmp(typeName, "terminal") == 0 ||
+            strcmp(typeName, "generator") == 0 ||
+            strcmp(typeName, "self-destruct console") == 0);
+}
+
+/* Get navigation guidance string based on left/right clearance */
+static const char* GetNavigationGuidance(VECTORCH* playerPos, DYNAMICSBLOCK* playerDyn, const char* typeName)
+{
+    /* Cast rays left and right to check clearance */
+    VECTORCH left, right;
+    left.vx = -playerDyn->OrientMat.mat11;
+    left.vy = 0;
+    left.vz = -playerDyn->OrientMat.mat13;
+    Normalise(&left);
+
+    right.vx = playerDyn->OrientMat.mat11;
+    right.vy = 0;
+    right.vz = playerDyn->OrientMat.mat13;
+    Normalise(&right);
+
+    int maxRange = 8000;  /* 8 meters */
+    int leftClear = CastObstructionRay(playerPos, &left, maxRange);
+    int rightClear = CastObstructionRay(playerPos, &right, maxRange);
+
+    /* Convert 0 (no hit) to max range for comparison */
+    if (leftClear == 0) leftClear = maxRange;
+    if (rightClear == 0) rightClear = maxRange;
+
+    LOG_DBG("Navigation guidance: L=%d R=%d", leftClear, rightClear);
+
+    /* Interactive objects have special guidance */
+    if (IsInteractiveType(typeName)) {
+        if (strcmp(typeName, "door") == 0 ||
+            strcmp(typeName, "proximity door") == 0 ||
+            strcmp(typeName, "lift door") == 0 ||
+            strcmp(typeName, "switch") == 0) {
+            return "Press SPACE to operate.";
+        }
+        if (strcmp(typeName, "lift") == 0) {
+            return "Step on to ride.";
+        }
+        if (strcmp(typeName, "terminal") == 0 ||
+            strcmp(typeName, "generator") == 0) {
+            return "Press SPACE to interact.";
+        }
+    }
+
+    /* For non-interactive obstacles, suggest direction */
+    int threshold = 2000;  /* Need at least 2m clearance to suggest */
+
+    if (leftClear > threshold && rightClear > threshold) {
+        /* Both sides clear - suggest the one with more room */
+        if (leftClear > rightClear + 1000) {
+            return "Go left to continue.";
+        } else if (rightClear > leftClear + 1000) {
+            return "Go right to continue.";
+        } else {
+            return "Clear paths left and right.";
+        }
+    } else if (leftClear > threshold) {
+        return "Go left to continue.";
+    } else if (rightClear > threshold) {
+        return "Go right to continue.";
+    }
+
+    /* Both sides blocked */
+    return "Path blocked. Try turning around.";
+}
+
+/* Announce current obstruction status (on-demand via hotkey) with navigation guidance */
 extern "C" void Obstruction_AnnounceAhead(void)
 {
     if (!Accessibility_IsAvailable()) {
@@ -2978,32 +4012,50 @@ extern "C" void Obstruction_AnnounceAhead(void)
     forward.vz = playerDyn->OrientMat.mat33;
     Normalise(&forward);
 
-    int forwardDist = CastObstructionRay(&playerPos, &forward, OBSTRUCTION_FAR_DIST * 2);
+    /* Use extended ray cast to get type information */
+    RAY_RESULT result = CastObstructionRayEx(&playerPos, &forward, OBSTRUCTION_FAR_DIST * 2);
 
-    char announcement[256];
+    char announcement[384];  /* Larger buffer for guidance text */
 
-    if (forwardDist > 0) {
+    if (result.distance > 0) {
         int isJumpable, isClearable;
         AnalyzeObstruction(&playerPos, &LOS_Point, &isJumpable, &isClearable);
 
-        const char* distDesc = GetDistanceDescription(forwardDist);
+        const char* distDesc = GetDistanceDescription(result.distance);
+        const char* typeName = result.typeName;
+        const char* guidance = "";
+
+        /* Log what was detected */
+        LOG_INF("Ahead check: %s at %d mm (jumpable=%d, clearable=%d)",
+                typeName, result.distance, isJumpable, isClearable);
+
+        /* Get navigation guidance for obstacles that can't be traversed */
+        if (!isJumpable && !isClearable) {
+            guidance = GetNavigationGuidance(&playerPos, playerDyn, typeName);
+        }
 
         if (isJumpable) {
             snprintf(announcement, sizeof(announcement),
-                     "Step %s, %d millimeters. Can walk over.",
-                     distDesc, forwardDist);
+                     "%s %s, %d millimeters. Can walk over.",
+                     typeName, distDesc, result.distance);
         } else if (isClearable) {
             snprintf(announcement, sizeof(announcement),
-                     "Obstacle %s, %d millimeters. Can jump over.",
-                     distDesc, forwardDist);
+                     "%s %s, %d millimeters. Can jump over.",
+                     typeName, distDesc, result.distance);
         } else {
+            /* Include navigation guidance */
             snprintf(announcement, sizeof(announcement),
-                     "Wall %s, %d millimeters.",
-                     distDesc, forwardDist);
+                     "%s %s, %d millimeters. %s",
+                     typeName, distDesc, result.distance, guidance);
+        }
+
+        /* Capitalize first letter */
+        if (announcement[0] >= 'a' && announcement[0] <= 'z') {
+            announcement[0] -= 32;
         }
 
         /* Play directional tone - centered since it's directly ahead */
-        NavTone_PlayDirectional(0.0f);
+        NavTone_PlayDirectional(0.0f, 0.0f);
     } else {
         snprintf(announcement, sizeof(announcement), "Clear ahead.");
     }
@@ -3021,13 +4073,13 @@ extern "C" void Obstruction_AnnounceAhead(void)
         lastAnnounceTime = currentTime;
     } else {
         /* Same announcement recently - just play tone without TTS */
-        if (forwardDist > 0) {
-            NavTone_PlayDirectional(0.0f);
+        if (result.distance > 0) {
+            NavTone_PlayDirectional(0.0f, 0.0f);
         }
     }
 }
 
-/* Announce surroundings (walls on all sides) */
+/* Announce surroundings (walls on all sides) with structure types */
 extern "C" void Obstruction_AnnounceSurroundings(void)
 {
     if (!Accessibility_IsAvailable()) return;
@@ -3061,10 +4113,11 @@ extern "C" void Obstruction_AnnounceSurroundings(void)
 
     int maxRange = OBSTRUCTION_FAR_DIST * 2;
 
-    int frontDist = CastObstructionRay(&playerPos, &forward, maxRange);
-    int leftDist = CastObstructionRay(&playerPos, &left, maxRange);
-    int rightDist = CastObstructionRay(&playerPos, &right, maxRange);
-    int backDist = CastObstructionRay(&playerPos, &back, maxRange);
+    /* Use extended ray casts to get type information */
+    RAY_RESULT frontResult = CastObstructionRayEx(&playerPos, &forward, maxRange);
+    RAY_RESULT leftResult = CastObstructionRayEx(&playerPos, &left, maxRange);
+    RAY_RESULT rightResult = CastObstructionRayEx(&playerPos, &right, maxRange);
+    RAY_RESULT backResult = CastObstructionRayEx(&playerPos, &back, maxRange);
 
     char announcement[512];
     char* ptr = announcement;
@@ -3072,8 +4125,9 @@ extern "C" void Obstruction_AnnounceSurroundings(void)
     int written;
 
     /* Front */
-    if (frontDist > 0 && frontDist < maxRange) {
-        written = snprintf(ptr, remaining, "Front %d. ", frontDist / 1000);
+    if (frontResult.distance > 0 && frontResult.distance < maxRange) {
+        written = snprintf(ptr, remaining, "Front: %s, %d meters. ",
+                          frontResult.typeName, frontResult.distance / 1000);
         ptr += written;
         remaining -= written;
     } else {
@@ -3083,8 +4137,9 @@ extern "C" void Obstruction_AnnounceSurroundings(void)
     }
 
     /* Left */
-    if (leftDist > 0 && leftDist < maxRange) {
-        written = snprintf(ptr, remaining, "Left %d. ", leftDist / 1000);
+    if (leftResult.distance > 0 && leftResult.distance < maxRange) {
+        written = snprintf(ptr, remaining, "Left: %s, %d meters. ",
+                          leftResult.typeName, leftResult.distance / 1000);
         ptr += written;
         remaining -= written;
     } else {
@@ -3094,8 +4149,9 @@ extern "C" void Obstruction_AnnounceSurroundings(void)
     }
 
     /* Right */
-    if (rightDist > 0 && rightDist < maxRange) {
-        written = snprintf(ptr, remaining, "Right %d. ", rightDist / 1000);
+    if (rightResult.distance > 0 && rightResult.distance < maxRange) {
+        written = snprintf(ptr, remaining, "Right: %s, %d meters. ",
+                          rightResult.typeName, rightResult.distance / 1000);
         ptr += written;
         remaining -= written;
     } else {
@@ -3105,11 +4161,18 @@ extern "C" void Obstruction_AnnounceSurroundings(void)
     }
 
     /* Back */
-    if (backDist > 0 && backDist < maxRange) {
-        written = snprintf(ptr, remaining, "Back %d.", backDist / 1000);
+    if (backResult.distance > 0 && backResult.distance < maxRange) {
+        written = snprintf(ptr, remaining, "Back: %s, %d meters.",
+                          backResult.typeName, backResult.distance / 1000);
     } else {
         written = snprintf(ptr, remaining, "Back clear.");
     }
+
+    LOG_INF("Surroundings: F=%s@%d L=%s@%d R=%s@%d B=%s@%d",
+            frontResult.typeName, frontResult.distance,
+            leftResult.typeName, leftResult.distance,
+            rightResult.typeName, rightResult.distance,
+            backResult.typeName, backResult.distance);
 
     TTS_Speak(announcement);
 }
@@ -3120,4 +4183,241 @@ extern "C" void Obstruction_Toggle(void)
     g_ObstructionState.enabled = !g_ObstructionState.enabled;
     TTS_Speak(g_ObstructionState.enabled ?
               "Obstruction alerts enabled" : "Obstruction alerts disabled");
+}
+
+/* ============================================
+ * Environment Description System
+ * ============================================ */
+
+/* Get spatial description based on distance */
+static const char* GetSpatialDescription(int distance)
+{
+    if (distance < 2000) return "immediately";      /* < 2m */
+    if (distance < 5000) return "nearby";           /* 2-5m */
+    if (distance < 10000) return "";                /* 5-10m - just "to your left" */
+    return "in the distance";                       /* > 10m */
+}
+
+/* Priority for sorting - lower = more important (announced first) */
+static int GetFeaturePriority(const char* typeName)
+{
+    /* Enemies - highest priority */
+    if (strcmp(typeName, "alien") == 0 || strcmp(typeName, "queen alien") == 0 ||
+        strcmp(typeName, "facehugger") == 0 || strcmp(typeName, "predator") == 0 ||
+        strcmp(typeName, "xenoborg") == 0 || strcmp(typeName, "marine") == 0 ||
+        strcmp(typeName, "autogun") == 0) {
+        return 0;
+    }
+    /* Interactive elements - high priority */
+    if (strcmp(typeName, "door") == 0 || strcmp(typeName, "proximity door") == 0 ||
+        strcmp(typeName, "lift door") == 0 || strcmp(typeName, "switch") == 0 ||
+        strcmp(typeName, "lift") == 0 || strcmp(typeName, "terminal") == 0 ||
+        strcmp(typeName, "generator") == 0 || strcmp(typeName, "self-destruct console") == 0) {
+        return 1;
+    }
+    /* Notable objects */
+    if (strcmp(typeName, "crate") == 0 || strcmp(typeName, "pillar") == 0 ||
+        strcmp(typeName, "object") == 0 || strcmp(typeName, "structure") == 0) {
+        return 2;
+    }
+    /* Walls - lowest priority */
+    return 3;
+}
+
+/* Environment scan result */
+typedef struct {
+    const char* direction;  /* "ahead", "to your left", etc. */
+    const char* typeName;   /* What's there */
+    int distance;           /* Distance in game units */
+    int priority;           /* For sorting */
+} ENV_SCAN_ENTRY;
+
+/* Compare function for sorting environment entries */
+static int CompareEnvEntries(const void* a, const void* b)
+{
+    const ENV_SCAN_ENTRY* entryA = (const ENV_SCAN_ENTRY*)a;
+    const ENV_SCAN_ENTRY* entryB = (const ENV_SCAN_ENTRY*)b;
+
+    /* First by priority (important features first) */
+    if (entryA->priority != entryB->priority) {
+        return entryA->priority - entryB->priority;
+    }
+    /* Then by distance (closer first) */
+    return entryA->distance - entryB->distance;
+}
+
+/* Describe the environment in all directions */
+extern "C" void Environment_Describe(void)
+{
+    if (!Accessibility_IsAvailable()) {
+        TTS_Speak("Environment scan unavailable.");
+        return;
+    }
+
+    if (!Player || !Player->ObStrategyBlock || !Player->ObStrategyBlock->DynPtr) {
+        TTS_Speak("Cannot scan: player unavailable.");
+        return;
+    }
+
+    DYNAMICSBLOCK* playerDyn = Player->ObStrategyBlock->DynPtr;
+    VECTORCH playerPos = playerDyn->Position;
+    playerPos.vy -= 800;  /* Chest height */
+
+    /* Get player's forward and right vectors */
+    VECTORCH forward, right;
+    forward.vx = playerDyn->OrientMat.mat31;
+    forward.vy = 0;  /* Horizontal only for direction calculations */
+    forward.vz = playerDyn->OrientMat.mat33;
+    Normalise(&forward);
+
+    right.vx = playerDyn->OrientMat.mat11;
+    right.vy = 0;
+    right.vz = playerDyn->OrientMat.mat13;
+    Normalise(&right);
+
+    /* Define 8 horizontal directions + up + down */
+    VECTORCH dirs[10];
+    const char* dirNames[10] = {
+        "ahead",
+        "ahead to your right",
+        "to your right",
+        "behind to your right",
+        "behind you",
+        "behind to your left",
+        "to your left",
+        "ahead to your left",
+        "above",
+        "below"
+    };
+
+    /* Calculate direction vectors */
+    /* Forward (0 degrees) */
+    dirs[0] = forward;
+
+    /* Forward-right (45 degrees) */
+    dirs[1].vx = (forward.vx + right.vx) / 2;
+    dirs[1].vy = 0;
+    dirs[1].vz = (forward.vz + right.vz) / 2;
+    Normalise(&dirs[1]);
+
+    /* Right (90 degrees) */
+    dirs[2] = right;
+
+    /* Back-right (135 degrees) */
+    dirs[3].vx = (-forward.vx + right.vx) / 2;
+    dirs[3].vy = 0;
+    dirs[3].vz = (-forward.vz + right.vz) / 2;
+    Normalise(&dirs[3]);
+
+    /* Back (180 degrees) */
+    dirs[4].vx = -forward.vx;
+    dirs[4].vy = 0;
+    dirs[4].vz = -forward.vz;
+
+    /* Back-left (225 degrees) */
+    dirs[5].vx = (-forward.vx - right.vx) / 2;
+    dirs[5].vy = 0;
+    dirs[5].vz = (-forward.vz - right.vz) / 2;
+    Normalise(&dirs[5]);
+
+    /* Left (270 degrees) */
+    dirs[6].vx = -right.vx;
+    dirs[6].vy = 0;
+    dirs[6].vz = -right.vz;
+
+    /* Forward-left (315 degrees) */
+    dirs[7].vx = (forward.vx - right.vx) / 2;
+    dirs[7].vy = 0;
+    dirs[7].vz = (forward.vz - right.vz) / 2;
+    Normalise(&dirs[7]);
+
+    /* Up */
+    dirs[8].vx = 0;
+    dirs[8].vy = -ONE_FIXED;  /* Up in AVP coordinate system */
+    dirs[8].vz = 0;
+
+    /* Down */
+    dirs[9].vx = 0;
+    dirs[9].vy = ONE_FIXED;
+    dirs[9].vz = 0;
+
+    /* Scan all directions */
+    int maxRange = OBSTRUCTION_FAR_DIST * 3;  /* Extended range for environment scan */
+    ENV_SCAN_ENTRY entries[10];
+    int numEntries = 0;
+    int numClearDirs = 0;
+    const char* clearDirections[10];
+
+    for (int i = 0; i < 10; i++) {
+        RAY_RESULT result = CastObstructionRayEx(&playerPos, &dirs[i], maxRange);
+
+        if (result.distance > 0 && result.distance < maxRange) {
+            entries[numEntries].direction = dirNames[i];
+            entries[numEntries].typeName = result.typeName;
+            entries[numEntries].distance = result.distance;
+            entries[numEntries].priority = GetFeaturePriority(result.typeName);
+            numEntries++;
+        } else {
+            /* Track clear directions */
+            clearDirections[numClearDirs++] = dirNames[i];
+        }
+    }
+
+    /* Sort entries by priority (important first) then distance */
+    if (numEntries > 1) {
+        qsort(entries, numEntries, sizeof(ENV_SCAN_ENTRY), CompareEnvEntries);
+    }
+
+    /* Build announcement */
+    char announcement[1024];
+    char* ptr = announcement;
+    int remaining = sizeof(announcement);
+    int written;
+
+    /* Start with clear paths (if any ahead) */
+    int hasOpenPath = 0;
+    for (int i = 0; i < numClearDirs; i++) {
+        if (strcmp(clearDirections[i], "ahead") == 0) {
+            written = snprintf(ptr, remaining, "Open path ahead. ");
+            ptr += written;
+            remaining -= written;
+            hasOpenPath = 1;
+            break;
+        }
+    }
+
+    /* Announce detected features (limit to 6 most important) */
+    int announced = 0;
+    for (int i = 0; i < numEntries && announced < 6; i++) {
+        const char* spatial = GetSpatialDescription(entries[i].distance);
+        int distMeters = entries[i].distance / 1000;
+
+        if (distMeters < 1) distMeters = 1;
+
+        if (strlen(spatial) > 0) {
+            written = snprintf(ptr, remaining, "%s %s %s, %d meters. ",
+                              entries[i].typeName, spatial, entries[i].direction, distMeters);
+        } else {
+            written = snprintf(ptr, remaining, "%s %s, %d meters. ",
+                              entries[i].typeName, entries[i].direction, distMeters);
+        }
+
+        /* Capitalize first letter of each sentence */
+        if (ptr[0] >= 'a' && ptr[0] <= 'z') {
+            ptr[0] -= 32;
+        }
+
+        ptr += written;
+        remaining -= written;
+        announced++;
+    }
+
+    /* If nothing detected, mention all clear */
+    if (numEntries == 0) {
+        snprintf(ptr, remaining, "Area is clear in all directions.");
+    }
+
+    LOG_INF("Environment scan: %d features detected, %d clear directions", numEntries, numClearDirs);
+
+    TTS_Speak(announcement);
 }

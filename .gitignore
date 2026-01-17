@@ -42,3 +42,6 @@ vcpkg_installed/
 
 # Claude Code local settings
 .claude/
+
+# Local documentation (not tracked in git)
+CLAUDE.md

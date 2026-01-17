@@ -174,6 +174,9 @@ void PlayerState_AnnounceAmmo(void);
 /* Announce all current stats */
 void PlayerState_AnnounceAll(void);
 
+/* Announce Predator energy cell / field charge status */
+void Accessibility_AnnounceEnergy(void);
+
 /* ============================================
  * Navigation Audio Cues
  * ============================================ */
@@ -203,6 +206,10 @@ void PitchIndicator_Update(void);
 
 /* Hook for menu text rendering - call when menu text is displayed */
 void Menu_OnTextDisplayed(const char* text, int isSelected);
+
+/* Set cooldown to prevent render hooks from double-announcing
+ * Call this after explicit menu announcements (like Accessibility_AnnounceMenuSelection) */
+void Menu_SetAnnouncementCooldown(void);
 
 /* Announce current menu item */
 void Menu_AnnounceCurrentItem(void);
@@ -276,7 +283,41 @@ typedef enum {
     NAV_TARGET_ITEM           /* Health, ammo, weapon pickup */
 } NAV_TARGET_TYPE;
 
-/* Current navigation state */
+/* Navigation strategies for pathfinding */
+typedef enum {
+    NAV_STRATEGY_DIRECT,           /* Go straight toward target */
+    NAV_STRATEGY_WALL_FOLLOW_LEFT, /* Follow left wall */
+    NAV_STRATEGY_WALL_FOLLOW_RIGHT,/* Follow right wall */
+    NAV_STRATEGY_BACKTRACK,        /* Back up and retry */
+    NAV_STRATEGY_WIDE_AROUND_LEFT, /* Wide arc left */
+    NAV_STRATEGY_WIDE_AROUND_RIGHT /* Wide arc right */
+} NAV_STRATEGY;
+
+/* Position record for history tracking */
+typedef struct {
+    int x, y, z;
+    unsigned int timestamp;
+} POSITION_RECORD;
+
+#define NAV_POSITION_HISTORY_SIZE 30  /* ~5 seconds at 6 samples/sec */
+
+/* Door wait state for autonavigation */
+typedef struct {
+    void* doorSB;              /* STRATEGYBLOCK* - door we're waiting for */
+    int lastState;             /* Last known door state */
+    unsigned int waitStartTime;/* When we started waiting */
+    int announced;             /* Have we announced waiting? */
+} DOOR_WAIT_STATE;
+
+/* Lift tracking state */
+typedef struct {
+    void* liftSB;              /* STRATEGYBLOCK* - lift we're tracking */
+    int lastState;             /* Last known lift state */
+    int playerOnLift;          /* Is player currently on lift? */
+    unsigned int rideStartTime;
+} LIFT_TRACK_STATE;
+
+/* Current navigation state (extended) */
 typedef struct {
     int enabled;              /* Is autonavigation active */
     int auto_rotate;          /* Automatically rotate toward target */
@@ -285,6 +326,29 @@ typedef struct {
     int target_x, target_y, target_z;  /* Target world position */
     int target_distance;      /* Distance to target */
     const char* target_name;  /* Name for TTS */
+
+    /* Position history for loop detection */
+    POSITION_RECORD position_history[NAV_POSITION_HISTORY_SIZE];
+    int history_index;
+    int history_count;
+
+    /* Progress tracking */
+    int last_announced_distance;  /* For "getting closer/farther" */
+    int closest_achieved;         /* Closest we've ever been to this target */
+    unsigned int last_progress_time;
+
+    /* Strategy management */
+    NAV_STRATEGY current_strategy;
+    int strategy_frames;          /* How long current strategy has been active */
+    int strategy_failures;        /* How many times strategies have failed */
+
+    /* Door/Lift awareness */
+    DOOR_WAIT_STATE door_wait;
+    LIFT_TRACK_STATE lift_track;
+
+    /* Arrival handling */
+    int arrival_announced;
+    int target_reached;
 } AUTONAV_STATE;
 
 extern AUTONAV_STATE AutoNavState;
@@ -312,6 +376,53 @@ void AutoNav_FindTarget(void);
 
 /* Announce current navigation target */
 void AutoNav_AnnounceTarget(void);
+
+/* Pathfinding functions */
+void PathFind_RecordPosition(int x, int y, int z);
+int PathFind_DetectOscillation(void);
+int PathFind_DetectLoop(int* loopSize);
+void PathFind_EscalateStrategy(void);
+
+/* Progress and arrival functions */
+void AutoNav_CheckProgress(void);
+void AutoNav_CheckArrival(void);
+
+/* ============================================
+ * Spatial Awareness System
+ * ============================================ */
+
+/* Tracked threat for proximity awareness */
+typedef struct {
+    void* threat;              /* STRATEGYBLOCK* */
+    int last_distance;
+    int current_distance;
+    int approach_rate;         /* Negative = getting closer */
+    unsigned int last_update;
+    int warning_given;
+} TRACKED_THREAT;
+
+#define MAX_TRACKED_THREATS 8
+
+/* Spatial awareness state */
+typedef struct {
+    TRACKED_THREAT threats[MAX_TRACKED_THREATS];
+    int threat_count;
+    int threat_check_counter;
+    int is_enclosed;           /* Walls close on 3+ sides */
+    int is_open;               /* Mostly open space */
+    unsigned int last_threat_tts;
+} SPATIAL_AWARENESS_STATE;
+
+extern SPATIAL_AWARENESS_STATE SpatialState;
+
+/* Update spatial awareness - call each frame */
+void SpatialAwareness_Update(void);
+
+/* Update threat tracking */
+void SpatialAwareness_UpdateThreats(void);
+
+/* Play threat proximity tone */
+void SpatialAwareness_ThreatTone(void);
 
 /* ============================================
  * Interactive Element Scanning
@@ -344,6 +455,17 @@ void Obstruction_AnnounceSurroundings(void);
 
 /* Toggle obstruction alert system on/off */
 void Obstruction_Toggle(void);
+
+/* ============================================
+ * Environment Description System
+ * ============================================ */
+
+/* Describe the environment in all directions (8 horizontal + up/down)
+ * Announces features sorted by priority (enemies first, then interactive, then walls)
+ * Includes distance and spatial description (immediately, nearby, in the distance)
+ * Bound to Tab key
+ */
+void Environment_Describe(void);
 
 /* ============================================
  * Utility Functions
