@@ -1,0 +1,44 @@
+# Build directories
+NakedAVP/build/
+build/
+
+# Visual Studio
+.vs/
+*.vcxproj.user
+*.suo
+*.user
+*.sln.docstates
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Compiled binaries
+*.exe
+*.dll
+*.lib
+*.obj
+*.o
+*.a
+*.pdb
+*.ilk
+*.exp
+
+# IDE and editors
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# vcpkg installed packages (if local)
+vcpkg_installed/
+
+# Claude Code local settings
+.claude/
